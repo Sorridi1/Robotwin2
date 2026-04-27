@@ -52,11 +52,11 @@ def main():
     num = args.expert_data_num
     task_config = args.task_config
 
-    load_dir = "../../data/" + str(task_name) + "/" + str(task_config)
+    load_dir = "/media/Elements1/ljj/ManiFlow/data/dataset/" + str(task_name) + "/" + str(task_config)
 
     total_count = 0
 
-    save_dir = f"./data/{task_name}-{task_config}-{num}.zarr"
+    save_dir = f"/media/Elements1/ljj/ManiFlow/data/dataset/{task_name}-{task_config}-{num}.zarr"
 
     if os.path.exists(save_dir):
         shutil.rmtree(save_dir)
