@@ -9,7 +9,7 @@
 train=true
 eval=true
 train_task_config=${3} # setting for training, demo_clean or demo_randomized, add here for clarity
-eval_task_config=demo_randomized # setting for evaluation, demo_clean or demo_randomized
+eval_task_config=${train_task_config} # use the same config for evaluation unless you override it manually
 
 policy_name=ManiFlow
 task_name=${1}
@@ -24,7 +24,7 @@ eval_seed=0 # seed for evaluation, can be changed to 1, 2, etc.
 
 if [ "$train" = true ]; then
     echo "Training is enabled."
-    if [ ! -d "./data/${task_name}-${task_config}-${expert_data_num}.zarr" ]; then
+    if [ ! -d "/media/Elements1/ljj/ManiFlow/data/dataset/${task_name}-${task_config}-${expert_data_num}.zarr" ]; then
         bash process_data.sh ${task_name} ${task_config} ${expert_data_num}
     fi
     bash scripts/train_policy.sh ${alg_name} ${task_name} ${task_config} ${expert_data_num} ${addition_info} ${seed} ${gpu_id}

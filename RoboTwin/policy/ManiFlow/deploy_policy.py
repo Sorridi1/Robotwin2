@@ -54,7 +54,7 @@ def get_model(usr_args):
     addition_info = usr_args['addition_info']
     seed = usr_args['training_seed']
     exp_name = f"{task_name}-{alg_name}-{addition_info}"
-    run_dir = os.path.join(parent_directory, "data", "outputs", exp_name + f"_seed{seed}")
+    run_dir = os.path.join("/media/Elements1/ljj/ManiFlow/outputs", exp_name + f"_seed{seed}")
 
 
     hydra_runtime_cfg = {
@@ -75,6 +75,8 @@ def get_model(usr_args):
     cfg.task_name = usr_args["task_name"]
     cfg.expert_data_num = usr_args["expert_data_num"]
     cfg.raw_task_name = usr_args["task_name"]
+    cfg.setting = usr_args["ckpt_setting"]
+    cfg.training.seed = int(seed)
     OmegaConf.set_struct(cfg, True)
 
     ManiFlow_Model = ManiFlow(cfg, usr_args, run_dir=run_dir)
