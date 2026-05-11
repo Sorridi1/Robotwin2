@@ -1,0 +1,17 @@
+# Maximum number of policy steps used during evaluation.
+# If a task is not listed, Base_Task falls back to 1000 after this file exists.
+
+place_empty_cup: 500
+pick_apple_messy: 250
+place_container_plate: 350
+place_shoe: 400
+place_dual_shoes: 600
+pick_dual_bottles: 400
+pick_diverse_bottles: 400
+handover_block: 600
+handover_mic: 600
+beat_block_hammer: 400
+hanging_mug: 800
+lift_pot: 600
+move_can_pot: 400
+put_object_cabinet: 600

@@ -1,0 +1,14 @@
+ur5-wsg:
+  file_path: ./assets/embodiments/ur5-wsg
+
+aloha-agilex:
+  file_path: ./assets/embodiments/aloha-agilex
+
+franka-panda:
+  file_path: ./assets/embodiments/franka-panda
+
+piper:
+  file_path: ./assets/embodiments/piper
+
+ARX-X5:
+  file_path: ./assets/embodiments/ARX-X5

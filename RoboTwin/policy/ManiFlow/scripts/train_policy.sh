@@ -12,7 +12,7 @@ seed=${6}
 gpu_id=${7}
 
 exp_name=${task_name}-${alg_name}-${addition_info}
-run_dir="data/outputs/${exp_name}_seed${seed}"
+run_dir="/media/Elements1/ljj/ManiFlow/outputs/${exp_name}_seed${seed}"
 
 
 
