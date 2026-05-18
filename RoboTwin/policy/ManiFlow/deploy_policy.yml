@@ -8,6 +8,7 @@ instruction_type: unseen
 
 # Add Parameters You Need
 config_name: robot_maniflow
+ckpt_tag: latest
 checkpoint_num: 1000
 maniflow_task: demo_task
 expert_data_num: null

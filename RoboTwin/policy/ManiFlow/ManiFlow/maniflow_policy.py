@@ -91,7 +91,8 @@ class ManiFlow:
 
     def get_policy_and_runner(self, cfg, usr_args, run_dir):
         workspace = TrainManiFlowRoboTwinWorkspace(cfg, output_dir=run_dir)
-        policy, env_runner, epoch = workspace.get_policy_and_runner(cfg, usr_args, mode='latest')
+        ckpt_tag = usr_args.get("ckpt_tag", "latest")
+        policy, env_runner, epoch = workspace.get_policy_and_runner(cfg, usr_args, mode=ckpt_tag)
         return policy, env_runner, epoch
 
 if __name__ == "__main__":

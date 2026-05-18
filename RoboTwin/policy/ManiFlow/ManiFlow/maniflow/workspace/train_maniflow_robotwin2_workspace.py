@@ -411,6 +411,7 @@ class TrainManiFlowRoboTwinWorkspace:
             cprint(f"{self.epoch} epochs, {self.global_step} steps", 'magenta')
         else:
             cprint(f"Checkpoint {lastest_ckpt_path} does not exist!", 'red')
+            raise FileNotFoundError(f"Checkpoint {lastest_ckpt_path} does not exist!")
         
         n_obs_steps = cfg['n_obs_steps']
         n_action_steps = cfg['n_action_steps']
@@ -516,7 +517,7 @@ class TrainManiFlowRoboTwinWorkspace:
             
             return pathlib.Path(self.output_dir).joinpath('checkpoints', best_ckpt)
         else:
-            raise NotImplementedError(f"tag {tag} not implemented")
+            return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
             
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
