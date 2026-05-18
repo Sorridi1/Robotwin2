@@ -359,7 +359,7 @@ class TrainManiFlowRoboTwinWorkspace:
                 step_log['test_mean_score'] = - train_loss
 
             # checkpoint
-            if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
+            if ((self.epoch % cfg.training.checkpoint_every) == 0 or self.epoch == cfg.training.num_epochs - 1) and cfg.checkpoint.save_ckpt:
 
                 if cfg.checkpoint.save_last_ckpt:
                     self.save_checkpoint()
@@ -385,7 +385,7 @@ class TrainManiFlowRoboTwinWorkspace:
                 # save_path = f"checkpoints/{self.cfg.task.name}_{cfg.training.seed}/{self.epoch + 1}.ckpt"
 
                 # self.save_checkpoint(save_path)
-                
+                 
 
             # ========= eval end for this epoch ==========
             policy.train()
@@ -411,6 +411,7 @@ class TrainManiFlowRoboTwinWorkspace:
             cprint(f"{self.epoch} epochs, {self.global_step} steps", 'magenta')
         else:
             cprint(f"Checkpoint {lastest_ckpt_path} does not exist!", 'red')
+            raise FileNotFoundError(f"Checkpoint {lastest_ckpt_path} does not exist!")
         
         n_obs_steps = cfg['n_obs_steps']
         n_action_steps = cfg['n_action_steps']
@@ -516,7 +517,7 @@ class TrainManiFlowRoboTwinWorkspace:
             
             return pathlib.Path(self.output_dir).joinpath('checkpoints', best_ckpt)
         else:
-            raise NotImplementedError(f"tag {tag} not implemented")
+            return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
             
 
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):

@@ -1,0 +1,227 @@
+defaults:
+  - task: demo_task
+
+name: train_reinflow_rl_pointcloud_robotwin2
+
+task_name: null
+task_config: demo_clean_ur5
+instruction_type: unseen
+shape_meta: ${task.shape_meta}
+exp_name: "debug-rl"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 16
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: maniflow.policy.maniflow_pointcloud_policy.ManiFlowTransformerPointcloudPolicy
+  block_type: "DiTX"
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  visual_cond_len: 512
+  max_lang_cond_len: 1024
+  qkv_bias: true
+  qk_norm: true
+
+  language_conditioned: false
+  pre_norm_modality: false
+
+  flow_batch_ratio: 0.75
+  consistency_batch_ratio: 0.25
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete"
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
+  use_point_crop: true
+  crop_shape:
+    - 80
+    - 80
+  encoder_type: "DP3Encoder"
+  encoder_output_dim: 128
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  use_pc_color: true
+  pointnet_type: "pointnet"
+  downsample_points: true
+  pointcloud_encoder_cfg:
+    in_channels: 3
+    out_channels: ${policy.encoder_output_dim}
+    use_layernorm: true
+    final_norm: layernorm
+    normal_channel: false
+    num_points: ${policy.visual_cond_len}
+    pointwise: true
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  use_ema: true
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${exp_name}
+  project: ManiFlow-RL
+  resume: false
+  tags:
+    - ${logging.project}
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+checkpoint:
+  save_ckpt: true
+  topk:
+    monitor_key: rollout_success_rate
+    mode: max
+    k: 1
+    format_str: 'epoch={epoch:04d}-rollout_success_rate={rollout_success_rate:.4f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+rl:
+  pretrained_checkpoint_path: null
+  pretrained_state_key: ema_model
+  strict_load_pretrained: true
+  resume: false
+  resume_path: null
+  checkpoint_every: 1
+  export_actor_checkpoint: true
+  export_resume_actor_only: false
+  export_resume_actor_tag: final_rl_actor
+  best_checkpoint:
+    enabled: true
+    # Keep deploy compatibility: latest.ckpt is updated only when the best actor improves.
+    metric: rollout/success_rate
+    mode: max
+    tag: best_success
+    update_latest_alias: true
+    min_delta: 1.0e-6
+
+  env:
+    _target_: maniflow.env.robotwin.robotwin_rl_env.RoboTwinRLEnv
+    task_name: ${task_name}
+    task_config: ${task_config}
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    seed: ${training.seed}
+    reward_mode: ${rl.reward_mode}
+    reward_agg_method: sum
+    expert_check: true
+    instruction_type: ${instruction_type}
+    ckpt_setting: ${setting}
+    render_freq: 0
+    clear_cache_freq: 5
+    max_seed_tries: 100
+    action_type: qpos
+
+  reward_mode: sparse_success
+  # reward_mode can also be set to stage_delta if the RoboTwin task implements stage_reward().
+
+  actor:
+    inference_steps: ${policy.num_inference_steps}
+    ft_denoising_steps: ${policy.num_inference_steps}
+    min_sampling_denoising_std: 0.001
+    min_logprob_denoising_std: 0.005
+    max_logprob_denoising_std: 0.02
+    randn_clip_value: 2.0
+    denoised_clip_value: 1.5
+    final_action_clip_value: 1.0
+    clip_ploss_coef: 0.2
+    clip_vloss_coef: null
+    logprob_min: -20.0
+    logprob_max: 20.0
+    normalize_denoising_horizon: true
+    normalize_act_space_dimension: true
+    account_for_initial_stochasticity: true
+    noise_hidden_dims: [128, 128]
+    noise_activation: tanh
+    actor_old_device: cuda:0
+    freeze_obs_encoder: true
+
+  critic:
+    _target_: maniflow.model.rl.pointcloud_critic.PointcloudCritic
+    shape_meta: ${shape_meta}
+    n_obs_steps: ${n_obs_steps}
+    encoder_output_dim: 128
+    use_pc_color: ${policy.use_pc_color}
+    pointnet_type: ${policy.pointnet_type}
+    downsample_points: ${policy.downsample_points}
+    pointcloud_encoder_cfg: ${policy.pointcloud_encoder_cfg}
+    hidden_dims: [256, 256]
+    activation: relu
+    pool: mean
+
+  rollout:
+    n_envs: 1
+    n_steps: 64
+    reset_each_iteration: true
+    buffer_device: cuda:0
+
+  ppo:
+    num_iterations: 50
+    batch_size: 4
+    update_epochs: 2
+    critic_warmup_iterations: 1
+    actor_lr: 1.0e-6
+    critic_lr: 3.0e-4
+    actor_weight_decay: 1.0e-4
+    critic_weight_decay: 1.0e-4
+    betas: [0.9, 0.95]
+    gamma: 0.99
+    gae_lambda: 0.95
+    ent_coef: 0.001
+    vf_coef: 0.5
+    max_grad_norm: 1.0
+    target_kl: 0.05
+    reward_scale_running: false
+    reward_scale_const: 1.0
+    bootstrap_on_truncated: false
+    use_amp: true
+    skip_actor_update_on_zero_success: true
+    skip_actor_update_on_zero_reward: true
+    min_success_rate_for_actor_update: 0.0
+    min_raw_reward_for_actor_update: 0.0
+
+  bc_anchor:
+    enabled: true
+    coeff: 0.05
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: /media/Elements1/ljj/ManiFlow/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: /media/Elements1/ljj/ManiFlow/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+checkpoint_num: 500
+expert_data_num: 50
+raw_task_name: none
+setting: none

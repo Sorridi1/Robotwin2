@@ -10,12 +10,14 @@ eval_video_log: true
 language_num: 1
 
 embodiment:
-  - aloha-agilex
+  - ur5-wsg
+  - ur5-wsg
+  - 0.7
 
 domain_randomization:
-  cluttered_table: false
+  cluttered_table: true
   random_background: false
-  clean_background_rate: 1.0
+  clean_background_rate: 0.0
   random_head_camera_dis: 0.0
   random_table_height: 0.0
   random_light: false
