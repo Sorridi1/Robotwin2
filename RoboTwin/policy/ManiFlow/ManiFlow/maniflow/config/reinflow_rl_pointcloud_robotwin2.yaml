@@ -4,7 +4,7 @@ defaults:
 name: train_reinflow_rl_pointcloud_robotwin2
 
 task_name: null
-task_config: demo_clean_ur5
+task_config: demo_messy_ur5
 instruction_type: unseen
 shape_meta: ${task.shape_meta}
 exp_name: "debug-rl"
@@ -108,20 +108,10 @@ rl:
   pretrained_checkpoint_path: null
   pretrained_state_key: ema_model
   strict_load_pretrained: true
-  resume: false
+  resume: true
   resume_path: null
   checkpoint_every: 1
   export_actor_checkpoint: true
-  export_resume_actor_only: false
-  export_resume_actor_tag: final_rl_actor
-  best_checkpoint:
-    enabled: true
-    # Keep deploy compatibility: latest.ckpt is updated only when the best actor improves.
-    metric: rollout/success_rate
-    mode: max
-    tag: best_success
-    update_latest_alias: true
-    min_delta: 1.0e-6
 
   env:
     _target_: maniflow.env.robotwin.robotwin_rl_env.RoboTwinRLEnv
@@ -136,26 +126,47 @@ rl:
     instruction_type: ${instruction_type}
     ckpt_setting: ${setting}
     render_freq: 0
-    clear_cache_freq: 5
+    clear_cache_freq: 1 # 清理显存频率
     max_seed_tries: 100
     action_type: qpos
+    reward_progress_scale: ${rl.reward.progress_scale}
+    reward_success_bonus: ${rl.reward.success_bonus}
+    reward_healthy: ${rl.reward.healthy}
+    reward_ctrl_cost_weight: ${rl.reward.ctrl_cost_weight}
+    reward_ctrl_cost_mode: ${rl.reward.ctrl_cost_mode}
+    reward_ctrl_cost_normalize: ${rl.reward.ctrl_cost_normalize}
+    reward_contact_cost_weight: ${rl.reward.contact_cost_weight}
+    reward_time_cost: ${rl.reward.time_cost}
+    reward_use_task_progress_fallback: ${rl.reward.use_task_progress_fallback}
 
-  reward_mode: sparse_success
-  # reward_mode can also be set to stage_delta if the RoboTwin task implements stage_reward().
+  reward_mode: ant_style
+  # reward_mode can also be set to sparse_success or stage_delta.
+  reward:
+    # Ant-style decomposition: progress + success + healthy - ctrl - contact - time.
+    # Progress uses task.stage_reward() when available; place_empty_cup has a distance fallback.
+    progress_scale: 1.0
+    success_bonus: 1.0
+    healthy: 0.0
+    ctrl_cost_weight: 0.001
+    ctrl_cost_mode: delta
+    ctrl_cost_normalize: true
+    contact_cost_weight: 0.0
+    time_cost: 0.0
+    use_task_progress_fallback: true
 
   actor:
     inference_steps: ${policy.num_inference_steps}
     ft_denoising_steps: ${policy.num_inference_steps}
-    min_sampling_denoising_std: 0.001
-    min_logprob_denoising_std: 0.005
-    max_logprob_denoising_std: 0.02
+    min_sampling_denoising_std: 0.003
+    min_logprob_denoising_std: 0.01
+    max_logprob_denoising_std: 0.04
     randn_clip_value: 2.0
     denoised_clip_value: 1.5
     final_action_clip_value: 1.0
-    clip_ploss_coef: 0.2
+    clip_ploss_coef: 0.05
     clip_vloss_coef: null
-    logprob_min: -20.0
-    logprob_max: 20.0
+    logprob_min: -5.0
+    logprob_max: 5.0
     normalize_denoising_horizon: true
     normalize_act_space_dimension: true
     account_for_initial_stochasticity: true
@@ -178,39 +189,46 @@ rl:
     pool: mean
 
   rollout:
-    n_envs: 1
+    # A6000 starting point: 24 RoboTwin envs stepped synchronously with batched actor inference.
+    # If RoboTwin/SAPIEN memory is tight, override rl.rollout.n_envs=16 or 20 first.
+    n_envs: 4
     n_steps: 64
+    env_seed_stride: 1000
     reset_each_iteration: true
-    buffer_device: cuda:0
+    buffer_device: cpu
 
   ppo:
-    num_iterations: 50
+    num_iterations: 200
     batch_size: 4
     update_epochs: 2
-    critic_warmup_iterations: 1
-    actor_lr: 1.0e-6
-    critic_lr: 3.0e-4
-    actor_weight_decay: 1.0e-4
-    critic_weight_decay: 1.0e-4
+    critic_warmup_iterations: 4
+    actor_lr: 3.0e-6
+    critic_lr: 5.0e-4
+    actor_weight_decay: 0.0
+    critic_weight_decay: 1.0e-5
     betas: [0.9, 0.95]
     gamma: 0.99
     gae_lambda: 0.95
-    ent_coef: 0.001
+    ent_coef: 0.005
     vf_coef: 0.5
     max_grad_norm: 1.0
-    target_kl: 0.05
-    reward_scale_running: false
+    target_kl: 0.03
+    reward_scale_running: true
     reward_scale_const: 1.0
     bootstrap_on_truncated: false
     use_amp: true
-    skip_actor_update_on_zero_success: true
-    skip_actor_update_on_zero_reward: true
+    skip_actor_update_on_zero_success: false
+    skip_actor_update_on_zero_reward: false
     min_success_rate_for_actor_update: 0.0
     min_raw_reward_for_actor_update: 0.0
+    downweight_actor_update_on_zero_success: true
+    zero_success_actor_loss_scale: 0.2
+    downweight_actor_update_on_zero_reward: false
+    zero_reward_actor_loss_scale: 0.25
 
   bc_anchor:
     enabled: true
-    coeff: 0.05
+    coeff: 0.1
 
 hydra:
   job:

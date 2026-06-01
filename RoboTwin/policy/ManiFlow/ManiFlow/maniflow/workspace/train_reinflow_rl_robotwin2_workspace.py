@@ -82,8 +82,6 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.global_step = 0
         self.epoch = 0
         self.current_obs = None
-        self.best_checkpoint_metric = None
-        self.best_checkpoint_itr = -1
         self.consecutive_zero_success_iters = 0
 
         seed = int(cfg.training.seed)
@@ -167,16 +165,45 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
     def _obs_to_tensor(self, obs: Dict[str, np.ndarray], device=None) -> Dict[str, torch.Tensor]:
         device = device or self.device
+        obs_list = list(obs) if isinstance(obs, (list, tuple)) else [obs]
         return {
-            "point_cloud": torch.from_numpy(obs["point_cloud"]).unsqueeze(0).to(device=device).float(),
-            "agent_pos": torch.from_numpy(obs["agent_pos"]).unsqueeze(0).to(device=device).float(),
+            "point_cloud": torch.from_numpy(
+                np.stack([item["point_cloud"] for item in obs_list], axis=0)
+            ).to(device=device).float(),
+            "agent_pos": torch.from_numpy(
+                np.stack([item["agent_pos"] for item in obs_list], axis=0)
+            ).to(device=device).float(),
         }
 
     def _obs_to_buffer(self, obs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        obs_list = list(obs) if isinstance(obs, (list, tuple)) else [obs]
         return {
-            "point_cloud": obs["point_cloud"][None].astype(np.float32),
-            "agent_pos": obs["agent_pos"][None].astype(np.float32),
+            "point_cloud": np.stack([item["point_cloud"] for item in obs_list], axis=0).astype(np.float32),
+            "agent_pos": np.stack([item["agent_pos"] for item in obs_list], axis=0).astype(np.float32),
         }
+
+    def _make_envs(self):
+        n_envs = int(self.cfg.rl.rollout.n_envs)
+        if n_envs < 1:
+            raise ValueError(f"rl.rollout.n_envs must be >= 1, got {n_envs}")
+        base_seed = int(self.cfg.training.seed)
+        base_start_seed = 100000 * (1 + base_seed)
+        env_seed_stride = int(self.cfg.rl.rollout.get("env_seed_stride", 1000))
+        envs = []
+        for env_idx in range(n_envs):
+            envs.append(
+                hydra.utils.instantiate(
+                    self.cfg.rl.env,
+                    seed=base_seed + env_idx,
+                    start_seed=base_start_seed + env_idx * env_seed_stride,
+                )
+            )
+        cprint(
+            f"[RL] Created {n_envs} RoboTwin envs with start_seed={base_start_seed}, "
+            f"env_seed_stride={env_seed_stride}",
+            "cyan",
+        )
+        return envs
 
     def _make_buffer(self):
         obs_meta = self.cfg.shape_meta.obs
@@ -197,56 +224,11 @@ class TrainReinFlowRLRoboTwinWorkspace:
             device=str(self.cfg.rl.rollout.buffer_device),
         )
 
-    def _get_best_checkpoint_cfg(self):
-        if "best_checkpoint" in self.cfg.rl:
-            return self.cfg.rl.best_checkpoint
-        return {}
-
-    def _is_better_checkpoint_metric(self, metric_value: float) -> bool:
-        best_cfg = self._get_best_checkpoint_cfg()
-        mode = str(best_cfg.get("mode", "max")).lower()
-        min_delta = float(best_cfg.get("min_delta", 0.0))
-        if self.best_checkpoint_metric is None:
-            return True
-        if mode == "min":
-            return metric_value < float(self.best_checkpoint_metric) - min_delta
-        return metric_value > float(self.best_checkpoint_metric) + min_delta
-
-    def maybe_export_best_actor_checkpoint(self, step_log: Dict[str, float]) -> bool:
-        best_cfg = self._get_best_checkpoint_cfg()
-        if not bool(best_cfg.get("enabled", True)):
-            return False
-        if not bool(self.cfg.rl.export_actor_checkpoint):
-            return False
-
-        metric_key = str(best_cfg.get("metric", "rollout/success_rate"))
-        if metric_key not in step_log:
-            cprint(f"[RL] Best checkpoint metric {metric_key} is missing; skip best export.", "yellow")
-            return False
-
-        metric_value = float(step_log[metric_key])
-        if not self._is_better_checkpoint_metric(metric_value):
-            return False
-
-        tag = str(best_cfg.get("tag", "best_success"))
-        self.best_checkpoint_metric = metric_value
-        self.best_checkpoint_itr = int(self.itr)
-        best_path = self.export_actor_checkpoint(tag)
-
-        if bool(best_cfg.get("update_latest_alias", True)):
-            self.export_actor_checkpoint("latest")
-
-        cprint(
-            f"[RL] New best actor checkpoint at itr={self.itr}: "
-            f"{metric_key}={metric_value:.4f}, saved {best_path}",
-            "green",
-        )
-        return True
-
     def should_update_actor(self, rollout_log: Dict[str, float]):
         warmup_iters = int(self.cfg.rl.ppo.critic_warmup_iterations)
         success_rate = float(rollout_log.get("success_rate", 0.0))
         raw_reward_sum = float(rollout_log.get("rollout_raw_reward_sum", 0.0))
+        actor_loss_scale = 1.0
 
         if success_rate <= 0.0:
             self.consecutive_zero_success_iters += 1
@@ -254,26 +236,54 @@ class TrainReinFlowRLRoboTwinWorkspace:
             self.consecutive_zero_success_iters = 0
 
         if self.itr < warmup_iters:
-            return False, "critic_warmup", 1
+            return False, "critic_warmup", 1, 0.0
 
         min_success = float(self.cfg.rl.ppo.get("min_success_rate_for_actor_update", 0.0))
         if bool(self.cfg.rl.ppo.get("skip_actor_update_on_zero_success", True)) and success_rate <= min_success:
-            return False, "zero_success_rollout", 2
+            return False, "zero_success_rollout", 2, 0.0
 
         min_raw_reward = float(self.cfg.rl.ppo.get("min_raw_reward_for_actor_update", 0.0))
         if bool(self.cfg.rl.ppo.get("skip_actor_update_on_zero_reward", False)) and raw_reward_sum <= min_raw_reward:
-            return False, "zero_reward_rollout", 3
+            return False, "zero_reward_rollout", 3, 0.0
 
-        return True, "enabled", 0
+        downweight_reasons = []
+        downweight_code = 0
+        if bool(self.cfg.rl.ppo.get("downweight_actor_update_on_zero_success", False)) and success_rate <= min_success:
+            actor_loss_scale = min(
+                actor_loss_scale,
+                float(self.cfg.rl.ppo.get("zero_success_actor_loss_scale", 0.25)),
+            )
+            downweight_reasons.append("zero_success_downweighted")
+            downweight_code = max(downweight_code, 4)
 
-    def collect_rollout(self, env, buffer: PPOBufferPointcloud):
+        if bool(self.cfg.rl.ppo.get("downweight_actor_update_on_zero_reward", False)) and raw_reward_sum <= min_raw_reward:
+            actor_loss_scale = min(
+                actor_loss_scale,
+                float(self.cfg.rl.ppo.get("zero_reward_actor_loss_scale", 0.25)),
+            )
+            downweight_reasons.append("zero_reward_downweighted")
+            downweight_code = max(downweight_code, 5)
+
+        actor_loss_scale = max(0.0, min(1.0, actor_loss_scale))
+        if downweight_reasons:
+            return True, "+".join(downweight_reasons), downweight_code, actor_loss_scale
+
+        return True, "enabled", 0, actor_loss_scale
+
+    def collect_rollout(self, envs, buffer: PPOBufferPointcloud):
+        if not isinstance(envs, (list, tuple)):
+            envs = [envs]
+        n_envs = len(envs)
+        if n_envs != buffer.n_envs:
+            raise ValueError(f"Expected {buffer.n_envs} envs, got {n_envs}")
+
         if self.current_obs is None or bool(self.cfg.rl.rollout.reset_each_iteration):
-            self.current_obs = env.reset()
+            self.current_obs = [env.reset() for env in envs]
 
         self.ppo_actor.eval()
         self.critic.eval()
         rollout_infos = []
-        desc = f"RL rollout itr {self.itr}"
+        desc = f"RL rollout itr {self.itr} ({n_envs} envs)"
         iterator = range(buffer.n_steps)
         with tqdm.tqdm(iterator, desc=desc, leave=False, mininterval=self.cfg.training.tqdm_interval_sec) as pbar:
             for step in pbar:
@@ -287,48 +297,90 @@ class TrainReinFlowRLRoboTwinWorkspace:
                         save_chains=True,
                         ret_logprob=True,
                     )
-                action_np = action.squeeze(0).detach().cpu().numpy()
-                next_obs, reward, terminated, truncated, info = env.step(action_np)
-                raw_reward = float(np.sum(info.get("raw_rewards", [reward])))
+                if action.shape[0] != n_envs or chains.shape[0] != n_envs or logprob.shape[0] != n_envs:
+                    raise RuntimeError(
+                        "Batched actor output does not match n_envs: "
+                        f"action={tuple(action.shape)}, chains={tuple(chains.shape)}, "
+                        f"logprob={tuple(logprob.shape)}, n_envs={n_envs}"
+                    )
+                action_np = action.detach().cpu().numpy()
+
+                next_obs_batch = []
+                rewards = np.zeros(n_envs, dtype=np.float32)
+                raw_rewards = np.zeros(n_envs, dtype=np.float32)
+                terminateds = np.zeros(n_envs, dtype=bool)
+                truncateds = np.zeros(n_envs, dtype=bool)
+                successes = np.zeros(n_envs, dtype=bool)
+                executed_steps = 0
+                step_infos = []
+
+                for env_idx, env in enumerate(envs):
+                    next_obs, reward, terminated, truncated, info = env.step(action_np[env_idx])
+                    raw_reward = float(np.sum(info.get("raw_rewards", [reward])))
+
+                    rewards[env_idx] = float(reward)
+                    raw_rewards[env_idx] = raw_reward
+                    terminateds[env_idx] = bool(terminated)
+                    truncateds[env_idx] = bool(truncated)
+                    successes[env_idx] = bool(info.get("success", False))
+                    executed_steps += int(info.get("executed_action_steps", self.cfg.n_action_steps))
+                    step_infos.append(info)
+                    rollout_infos.append(info)
+
+                    if terminated or truncated:
+                        next_obs = env.reset()
+                    next_obs_batch.append(next_obs)
+
                 buffer.add(
                     step=step,
                     obs=obs_for_buffer,
                     chains=chains.detach().cpu().numpy(),
-                    reward=np.asarray([reward], dtype=np.float32),
-                    terminated=np.asarray([terminated], dtype=bool),
-                    truncated=np.asarray([truncated], dtype=bool),
+                    reward=rewards,
+                    terminated=terminateds,
+                    truncated=truncateds,
                     value=value,
                     logprob=logprob.detach().cpu().numpy(),
-                    success=np.asarray([info.get("success", False)], dtype=bool),
-                    raw_reward=np.asarray([raw_reward], dtype=np.float32),
+                    success=successes,
+                    raw_reward=raw_rewards,
                 )
-                self.global_step += int(info.get("executed_action_steps", self.cfg.n_action_steps))
-                rollout_infos.append(info)
+                self.global_step += executed_steps
                 pbar.set_postfix(
-                    reward=f"{reward:.2f}",
-                    success=int(info.get("success", False)),
-                    env_step=info.get("take_action_cnt", 0),
+                    reward=f"{float(np.mean(rewards)):.2f}",
+                    success=int(np.sum(successes)),
+                    env_step=max((info.get("take_action_cnt", 0) for info in step_infos), default=0),
                     refresh=False,
                 )
-                self.current_obs = next_obs
-                if terminated or truncated:
-                    self.current_obs = env.reset()
+                self.current_obs = next_obs_batch
 
         summary = buffer.summarize_episode_reward()
+        summary["rollout_envs"] = n_envs
         summary["rollout_chunks"] = len(rollout_infos)
         summary["rollout_last_env_step"] = rollout_infos[-1].get("take_action_cnt", 0) if rollout_infos else 0
         summary["rollout_any_success_info"] = float(any(info.get("success", False) for info in rollout_infos))
+        for key in ("forward", "success", "healthy", "ctrl", "contact", "time"):
+            summary[f"reward_{key}_sum"] = float(
+                np.sum([info.get(f"reward_{key}", 0.0) for info in rollout_infos])
+            )
         return summary
 
-    def ppo_update(self, buffer: PPOBufferPointcloud, update_actor: bool = True):
+    def ppo_update(
+        self,
+        buffer: PPOBufferPointcloud,
+        update_actor: bool = True,
+        actor_loss_scale: float = 1.0,
+    ):
         buffer.update(self._obs_to_buffer(self.current_obs), self.critic)
         obs, chains, returns, values, advantages, logprobs = buffer.make_dataset()
         explained_var = buffer.get_explained_var(values, returns)
         total_steps = returns.shape[0]
+        expected_steps = buffer.n_steps * buffer.n_envs
+        if total_steps != expected_steps:
+            raise RuntimeError(f"PPO dataset has {total_steps} steps, expected {expected_steps}")
         batch_size = int(self.cfg.rl.ppo.batch_size)
         update_epochs = int(self.cfg.rl.ppo.update_epochs)
         target_kl = self.cfg.rl.ppo.target_kl
         actor_update_enabled = bool(update_actor) and self.itr >= int(self.cfg.rl.ppo.critic_warmup_iterations)
+        actor_loss_scale = max(0.0, min(1.0, float(actor_loss_scale)))
 
         self.ppo_actor.eval()
         self.critic.train()
@@ -357,11 +409,12 @@ class TrainReinFlowRLRoboTwinWorkspace:
                             critic=self.critic,
                             use_bc_loss=bool(self.cfg.rl.bc_anchor.enabled),
                         )
+                        actor_rl_loss = loss_dict["pg_loss"] + self.cfg.rl.ppo.ent_coef * loss_dict["entropy_loss"]
+                        bc_loss = self.cfg.rl.bc_anchor.coeff * loss_dict["bc_loss"]
                         loss = (
-                            loss_dict["pg_loss"]
-                            + self.cfg.rl.ppo.ent_coef * loss_dict["entropy_loss"]
+                            actor_loss_scale * actor_rl_loss
                             + self.cfg.rl.ppo.vf_coef * loss_dict["value_loss"]
-                            + self.cfg.rl.bc_anchor.coeff * loss_dict["bc_loss"]
+                            + bc_loss
                         )
                     else:
                         newvalues = self.critic(mb_obs).view(-1)
@@ -414,6 +467,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
                 item = {k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v) for k, v in loss_dict.items()}
                 item["loss"] = float(loss.detach().cpu())
+                item["actor_loss_scale"] = actor_loss_scale if actor_update_enabled else 0.0
                 metrics.append(item)
                 if actor_update_enabled and target_kl is not None and item["approx_kl"] > float(target_kl):
                     stopped_by_kl = True
@@ -442,26 +496,21 @@ class TrainReinFlowRLRoboTwinWorkspace:
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
-            "best_checkpoint_metric": self.best_checkpoint_metric,
-            "best_checkpoint_itr": self.best_checkpoint_itr,
             "consecutive_zero_success_iters": self.consecutive_zero_success_iters,
         }
         torch.save(payload, path.open("wb"), pickle_module=dill)
         return str(path)
 
-    def load_resume_checkpoint(self, path, load_optimizers=True):
+    def load_resume_checkpoint(self, path):
         payload = torch.load(open(path, "rb"), pickle_module=dill, map_location="cpu")
         self.itr = int(payload["itr"])
         self.global_step = int(payload.get("global_step", 0))
         self.ppo_actor.load_state_dict(payload["ppo_actor"], strict=False)
         self.critic.load_state_dict(payload["critic"])
-        if load_optimizers:
-            self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
-            self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
-        if load_optimizers and "scaler" in payload:
+        self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
+        if "scaler" in payload:
             self.scaler.load_state_dict(payload["scaler"])
-        self.best_checkpoint_metric = payload.get("best_checkpoint_metric", None)
-        self.best_checkpoint_itr = int(payload.get("best_checkpoint_itr", -1))
         self.consecutive_zero_success_iters = int(payload.get("consecutive_zero_success_iters", 0))
         cprint(f"[RL] Resumed RL checkpoint from {path}", "green")
 
@@ -492,31 +541,13 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
-        if int(cfg.rl.rollout.n_envs) != 1:
-            raise NotImplementedError("This minimal RoboTwin RL workspace currently supports n_envs=1.")
 
-        loaded_resume_checkpoint = False
-        export_resume_actor_only = bool(cfg.rl.get("export_resume_actor_only", False))
         if cfg.rl.resume_path:
-            self.load_resume_checkpoint(cfg.rl.resume_path, load_optimizers=not export_resume_actor_only)
-            loaded_resume_checkpoint = True
+            self.load_resume_checkpoint(cfg.rl.resume_path)
         elif bool(cfg.rl.resume):
             latest = pathlib.Path(self.output_dir) / "checkpoints" / "latest_rl.ckpt"
             if latest.is_file():
-                self.load_resume_checkpoint(latest, load_optimizers=not export_resume_actor_only)
-                loaded_resume_checkpoint = True
-
-        if export_resume_actor_only:
-            if not loaded_resume_checkpoint:
-                raise RuntimeError(
-                    "rl.export_resume_actor_only=true requires rl.resume_path "
-                    "or rl.resume=true with checkpoints/latest_rl.ckpt present."
-                )
-            pathlib.Path(self.output_dir).mkdir(parents=True, exist_ok=True)
-            tag = str(cfg.rl.get("export_resume_actor_tag", "final_rl_actor"))
-            export_path = self.export_actor_checkpoint(tag)
-            cprint(f"[RL] Exported deploy actor checkpoint from RL resume to {export_path}", "green")
-            return
+                self.load_resume_checkpoint(latest)
 
         pathlib.Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         use_wandb = cfg.logging.mode not in ("disabled", "none", None)
@@ -530,14 +561,14 @@ class TrainReinFlowRLRoboTwinWorkspace:
             )
             wandb.config.update({"output_dir": self.output_dir})
 
-        env = hydra.utils.instantiate(cfg.rl.env)
+        envs = self._make_envs()
         buffer = self._make_buffer()
         try:
             while self.itr < int(cfg.rl.ppo.num_iterations):
                 t0 = time.time()
                 buffer.reset()
-                rollout_log = self.collect_rollout(env, buffer)
-                update_actor, actor_skip_reason, actor_skip_code = self.should_update_actor(rollout_log)
+                rollout_log = self.collect_rollout(envs, buffer)
+                update_actor, actor_skip_reason, actor_skip_code, actor_loss_scale = self.should_update_actor(rollout_log)
                 step_log = {
                     "itr": self.itr,
                     "epoch": self.itr,
@@ -545,17 +576,16 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     "lr/actor": self.actor_optimizer.param_groups[0]["lr"],
                     "lr/critic": self.critic_optimizer.param_groups[0]["lr"],
                     "rl/actor_update_enabled": float(update_actor),
+                    "rl/actor_loss_scale": float(actor_loss_scale),
                     "rl/actor_update_skip_code": float(actor_skip_code),
                     "rl/consecutive_zero_success_iters": float(self.consecutive_zero_success_iters),
                 }
                 step_log.update({f"rollout/{k}": v for k, v in rollout_log.items()})
-                saved_best = self.maybe_export_best_actor_checkpoint(step_log)
-                step_log["rl/saved_best_actor_checkpoint"] = float(saved_best)
-                step_log["rl/best_checkpoint_itr"] = float(self.best_checkpoint_itr)
-                step_log["rl/best_checkpoint_metric"] = (
-                    float(self.best_checkpoint_metric) if self.best_checkpoint_metric is not None else float("nan")
+                update_log = self.ppo_update(
+                    buffer,
+                    update_actor=update_actor,
+                    actor_loss_scale=actor_loss_scale,
                 )
-                update_log = self.ppo_update(buffer, update_actor=update_actor)
                 step_log.update(update_log)
                 step_log["time/itr_sec"] = time.time() - t0
 
@@ -563,7 +593,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     f"[RL] itr={self.itr} step={self.global_step} "
                     f"succ={step_log.get('rollout/success_rate', 0):.3f} "
                     f"raw_reward={step_log.get('rollout/rollout_raw_reward_sum', 0):.3f} "
-                    f"actor_update={int(update_actor)}({actor_skip_reason}) "
+                    f"actor_update={int(update_actor)}({actor_skip_reason}, scale={actor_loss_scale:.2f}) "
                     f"loss={step_log.get('loss/loss', 0):.4f}",
                     "cyan",
                 )
@@ -576,9 +606,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     or self.itr == int(cfg.rl.ppo.num_iterations) - 1
                 ):
                     self.save_resume_checkpoint("latest_rl", itr=self.itr + 1)
-                    if bool(cfg.rl.export_actor_checkpoint) and not bool(
-                        self._get_best_checkpoint_cfg().get("enabled", True)
-                    ):
+                    if bool(cfg.rl.export_actor_checkpoint):
                         self.export_actor_checkpoint("latest")
 
                 self.itr += 1
@@ -592,11 +620,12 @@ class TrainReinFlowRLRoboTwinWorkspace:
                 "yellow",
             )
             self.save_resume_checkpoint("latest_rl")
-            if bool(cfg.rl.export_actor_checkpoint) and self.best_checkpoint_metric is None:
+            if bool(cfg.rl.export_actor_checkpoint):
                 self.export_actor_checkpoint("latest")
             raise
         finally:
-            env.close(clear_cache=True)
+            for env in envs:
+                env.close(clear_cache=True)
             if use_wandb:
                 wandb_run.finish()
 
