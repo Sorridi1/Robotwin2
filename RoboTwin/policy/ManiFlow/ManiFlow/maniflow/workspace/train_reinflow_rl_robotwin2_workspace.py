@@ -11,6 +11,8 @@ import copy
 import os
 import pathlib
 import random
+import re
+import subprocess
 import sys
 import time
 from typing import Dict, Optional
@@ -83,6 +85,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.epoch = 0
         self.current_obs = None
         self.consecutive_zero_success_iters = 0
+        self.best_eval_score = float("-inf")
+        self.best_eval_itr = -1
 
         seed = int(cfg.training.seed)
         torch.manual_seed(seed)
@@ -182,7 +186,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
             "agent_pos": np.stack([item["agent_pos"] for item in obs_list], axis=0).astype(np.float32),
         }
 
-    def _make_envs(self):
+    def _make_envs(self, start_seeds=None):
         n_envs = int(self.cfg.rl.rollout.n_envs)
         if n_envs < 1:
             raise ValueError(f"rl.rollout.n_envs must be >= 1, got {n_envs}")
@@ -195,11 +199,16 @@ class TrainReinFlowRLRoboTwinWorkspace:
                 hydra.utils.instantiate(
                     self.cfg.rl.env,
                     seed=base_seed + env_idx,
-                    start_seed=base_start_seed + env_idx * env_seed_stride,
+                    start_seed=(
+                        int(start_seeds[env_idx])
+                        if start_seeds is not None
+                        else base_start_seed + env_idx * env_seed_stride
+                    ),
                 )
             )
         cprint(
-            f"[RL] Created {n_envs} RoboTwin envs with start_seed={base_start_seed}, "
+            f"[RL] Created {n_envs} RoboTwin envs with start_seed="
+            f"{start_seeds if start_seeds is not None else base_start_seed}, "
             f"env_seed_stride={env_seed_stride}",
             "cyan",
         )
@@ -497,6 +506,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "scaler": self.scaler.state_dict(),
             "consecutive_zero_success_iters": self.consecutive_zero_success_iters,
+            "best_eval_score": self.best_eval_score,
+            "best_eval_itr": self.best_eval_itr,
         }
         torch.save(payload, path.open("wb"), pickle_module=dill)
         return str(path)
@@ -512,6 +523,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
         if "scaler" in payload:
             self.scaler.load_state_dict(payload["scaler"])
         self.consecutive_zero_success_iters = int(payload.get("consecutive_zero_success_iters", 0))
+        self.best_eval_score = float(payload.get("best_eval_score", float("-inf")))
+        self.best_eval_itr = int(payload.get("best_eval_itr", -1))
         cprint(f"[RL] Resumed RL checkpoint from {path}", "green")
 
     def export_actor_checkpoint(self, tag="latest"):
@@ -538,6 +551,137 @@ class TrainReinFlowRLRoboTwinWorkspace:
         }
         torch.save(payload, path.open("wb"), pickle_module=dill)
         return str(path)
+
+    def _eval_cfg_value(self, key, default=None):
+        eval_cfg = self.cfg.rl.get("eval", {})
+        if eval_cfg is None:
+            return default
+        return eval_cfg.get(key, default)
+
+    def _close_envs_for_eval(self, envs):
+        next_start_seeds = [int(getattr(env, "next_seed", 0)) for env in envs]
+        for env in envs:
+            env.close(clear_cache=True)
+        self.current_obs = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return next_start_seeds
+
+    def _parse_eval_score(self, result_path: pathlib.Path) -> float:
+        text = result_path.read_text(encoding="utf-8", errors="replace")
+        matches = re.findall(r"[-+]?(?:\d+\.\d+|\d+)", text)
+        if len(matches) == 0:
+            raise RuntimeError(f"Could not parse eval score from {result_path}")
+        return float(matches[-1])
+
+    def _derive_addition_info(self, config_name: str) -> str:
+        addition_info = self._eval_cfg_value("addition_info", None)
+        if addition_info not in (None, "", "null", "None"):
+            return str(addition_info)
+        exp_name = str(self.cfg.get("exp_name", ""))
+        prefix = f"{self.cfg.task_name}-{config_name}-"
+        if exp_name.startswith(prefix):
+            return exp_name[len(prefix):]
+        return exp_name
+
+    def run_eval_and_update_best(self, eval_iteration: int) -> Dict[str, float]:
+        if not bool(self._eval_cfg_value("enabled", False)):
+            return {}
+
+        config_name = str(self._eval_cfg_value("config_name", "reinflow_rl_pointcloud_robotwin2"))
+        alg_name = str(self._eval_cfg_value("alg_name", config_name))
+        policy_name = str(self._eval_cfg_value("policy_name", "ManiFlow"))
+        task_config = str(self._eval_cfg_value("task_config", self.cfg.task_config))
+        ckpt_setting = str(self._eval_cfg_value("ckpt_setting", task_config))
+        eval_seed = str(self._eval_cfg_value("seed", 0))
+        candidate_tag_base = str(self._eval_cfg_value("candidate_ckpt_tag", "eval_candidate"))
+        best_tag = str(self._eval_cfg_value("best_ckpt_tag", "best"))
+        candidate_tag = candidate_tag_base
+        addition_info = self._derive_addition_info(config_name)
+
+        self.export_actor_checkpoint(candidate_tag)
+
+        log_dir = pathlib.Path(self.output_dir) / "eval_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        eval_log_path = log_dir / f"{candidate_tag_base}_itr_{eval_iteration:04d}.log"
+        result_path = pathlib.Path(self.output_dir) / "eval_results" / f"epoch_{self.itr}" / "_result.txt"
+        if result_path.exists():
+            result_path.unlink()
+
+        cmd = [
+            sys.executable,
+            "script/eval_policy.py",
+            "--config",
+            f"policy/{policy_name}/deploy_policy.yml",
+            "--overrides",
+            "--config_name",
+            config_name,
+            "--task_name",
+            str(self.cfg.task_name),
+            "--task_config",
+            task_config,
+            "--ckpt_setting",
+            ckpt_setting,
+            "--expert_data_num",
+            str(self.cfg.expert_data_num),
+            "--training_seed",
+            str(self.cfg.training.seed),
+            "--seed",
+            eval_seed,
+            "--policy_name",
+            policy_name,
+            "--addition_info",
+            addition_info,
+            "--alg_name",
+            alg_name,
+            "--ckpt_tag",
+            candidate_tag,
+        ]
+        env = os.environ.copy()
+        env["PYTHONWARNINGS"] = "ignore::UserWarning"
+        cprint(
+            f"[RL Eval] itr={self.itr} running eval with ckpt_tag={candidate_tag}; log={eval_log_path}",
+            "yellow",
+        )
+        with eval_log_path.open("w", encoding="utf-8") as log_file:
+            proc = subprocess.run(
+                cmd,
+                cwd=ROBOTWIN_ROOT,
+                env=env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Periodic eval failed with return code {proc.returncode}. See {eval_log_path}"
+            )
+        if not result_path.is_file():
+            raise FileNotFoundError(f"Periodic eval did not write expected result file: {result_path}")
+
+        score = self._parse_eval_score(result_path)
+        is_best = score > self.best_eval_score
+        if is_best:
+            self.best_eval_score = score
+            self.best_eval_itr = int(eval_iteration)
+            self.export_actor_checkpoint(best_tag)
+            cprint(
+                f"[RL Eval] new best {score:.4f} at iteration {eval_iteration}; saved {best_tag}.ckpt",
+                "green",
+            )
+        else:
+            cprint(
+                f"[RL Eval] score={score:.4f}, best={self.best_eval_score:.4f} "
+                f"at iteration {self.best_eval_itr}",
+                "yellow",
+            )
+
+        return {
+            "eval/success_rate": score,
+            "eval/is_best": float(is_best),
+            "eval/best_success_rate": float(self.best_eval_score),
+            "eval/best_iteration": float(self.best_eval_itr),
+        }
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -566,6 +710,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
         try:
             while self.itr < int(cfg.rl.ppo.num_iterations):
                 t0 = time.time()
+                num_iterations = int(cfg.rl.ppo.num_iterations)
                 buffer.reset()
                 rollout_log = self.collect_rollout(envs, buffer)
                 update_actor, actor_skip_reason, actor_skip_code, actor_loss_scale = self.should_update_actor(rollout_log)
@@ -598,16 +743,35 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     "cyan",
                 )
 
-                if use_wandb:
-                    wandb_run.log(step_log, step=self.itr)
-
                 if (
                     self.itr % int(cfg.rl.checkpoint_every) == 0
-                    or self.itr == int(cfg.rl.ppo.num_iterations) - 1
+                    or self.itr == num_iterations - 1
                 ):
                     self.save_resume_checkpoint("latest_rl", itr=self.itr + 1)
                     if bool(cfg.rl.export_actor_checkpoint):
                         self.export_actor_checkpoint("latest")
+
+                eval_interval = int(self._eval_cfg_value("interval", 0))
+                eval_enabled = bool(self._eval_cfg_value("enabled", False)) and eval_interval > 0
+                eval_iteration = self.itr + 1
+                should_eval = eval_enabled and (
+                    eval_iteration % eval_interval == 0
+                    or (
+                        bool(self._eval_cfg_value("run_final", True))
+                        and self.itr == num_iterations - 1
+                    )
+                )
+                if should_eval:
+                    next_start_seeds = self._close_envs_for_eval(envs)
+                    envs = []
+                    eval_log = self.run_eval_and_update_best(eval_iteration)
+                    step_log.update(eval_log)
+                    self.save_resume_checkpoint("latest_rl", itr=self.itr + 1)
+                    if self.itr < num_iterations - 1:
+                        envs = self._make_envs(start_seeds=next_start_seeds)
+
+                if use_wandb:
+                    wandb_run.log(step_log, step=self.itr)
 
                 self.itr += 1
                 self.epoch = self.itr

@@ -54,7 +54,7 @@ policy_name=ManiFlow
 eval_task_config=${EVAL_TASK_CONFIG:-${task_config}}
 eval_ckpt_setting=${EVAL_CKPT_SETTING:-${task_config}}
 eval_seed=${EVAL_SEED:-0}
-eval_ckpt_tag=${EVAL_CKPT_TAG:-latest}
+eval_ckpt_tag=${EVAL_CKPT_TAG:-best}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFLOW_POLICY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -113,7 +113,14 @@ if [ "${train}" = true ]; then
         logging.name=${exp_name} \
         expert_data_num=${expert_data_num} \
         setting=${setting} \
-        rl.pretrained_checkpoint_path=${pretrained_ckpt}
+        rl.pretrained_checkpoint_path=${pretrained_ckpt} \
+        rl.eval.config_name=${config_name} \
+        rl.eval.alg_name=${alg_name} \
+        rl.eval.policy_name=${policy_name} \
+        rl.eval.task_config=${eval_task_config} \
+        rl.eval.ckpt_setting=${eval_ckpt_setting} \
+        rl.eval.seed=${eval_seed} \
+        rl.eval.addition_info=${addition_info}
 else
     echo -e "\033[33m=== RL training disabled ===\033[0m"
 fi

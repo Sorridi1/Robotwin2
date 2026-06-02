@@ -112,6 +112,19 @@ rl:
   resume_path: null
   checkpoint_every: 1
   export_actor_checkpoint: true
+  eval:
+    enabled: true
+    interval: 20
+    run_final: true
+    best_ckpt_tag: best
+    candidate_ckpt_tag: eval_candidate
+    config_name: reinflow_rl_pointcloud_robotwin2
+    alg_name: reinflow_rl_pointcloud_robotwin2
+    policy_name: ManiFlow
+    task_config: ${task_config}
+    ckpt_setting: ${task_config}
+    seed: 0
+    addition_info: null
 
   env:
     _target_: maniflow.env.robotwin.robotwin_rl_env.RoboTwinRLEnv
@@ -198,7 +211,7 @@ rl:
     buffer_device: cpu
 
   ppo:
-    num_iterations: 200
+    num_iterations: 60
     batch_size: 4
     update_epochs: 2
     critic_warmup_iterations: 4
