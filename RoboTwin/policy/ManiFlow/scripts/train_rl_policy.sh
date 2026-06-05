@@ -8,7 +8,7 @@ set -eo pipefail
 
 DEBUG=${DEBUG:-False}
 train=${TRAIN:-true}
-eval=${EVAL:-true}
+eval=${EVAL:-false}
 
 alg_name=${1:-reinflow_rl_pointcloud_robotwin2}
 task_name=${2}
@@ -51,6 +51,7 @@ config_name=${alg_name}
 exp_name=${task_name}-${alg_name}-${addition_info}
 run_dir="/media/Elements1/ljj/ManiFlow/outputs/${exp_name}_seed${seed}"
 policy_name=ManiFlow
+eval_policy_name=${RL_EVAL_POLICY_NAME:-ManiFlow}
 eval_task_config=${EVAL_TASK_CONFIG:-${task_config}}
 eval_ckpt_setting=${EVAL_CKPT_SETTING:-${task_config}}
 eval_seed=${EVAL_SEED:-0}
@@ -116,7 +117,7 @@ if [ "${train}" = true ]; then
         rl.pretrained_checkpoint_path=${pretrained_ckpt} \
         rl.eval.config_name=${config_name} \
         rl.eval.alg_name=${alg_name} \
-        rl.eval.policy_name=${policy_name} \
+        rl.eval.policy_name=${eval_policy_name} \
         rl.eval.task_config=${eval_task_config} \
         rl.eval.ckpt_setting=${eval_ckpt_setting} \
         rl.eval.seed=${eval_seed} \
@@ -131,7 +132,7 @@ if [ "${eval}" = false ]; then
 fi
 
 echo -e "\033[32m=== Evaluating ManiFlow RL policy ===\033[0m"
-echo -e "\033[33mckpt tag: ${eval_ckpt_tag}, gpu id: ${gpu_id}\033[0m"
+echo -e "\033[33mckpt tag: ${eval_ckpt_tag}, eval policy: ${eval_policy_name}, gpu id: ${gpu_id}\033[0m"
 
 cd "${ROBOTWIN_ROOT}"
 
@@ -145,7 +146,7 @@ ${PYTHON_BIN} script/eval_policy.py --config policy/${policy_name}/deploy_policy
     --expert_data_num ${expert_data_num} \
     --training_seed ${seed} \
     --seed ${eval_seed} \
-    --policy_name ${policy_name} \
+    --policy_name ${eval_policy_name} \
     --addition_info ${addition_info} \
     --alg_name ${alg_name} \
     --ckpt_tag ${eval_ckpt_tag}

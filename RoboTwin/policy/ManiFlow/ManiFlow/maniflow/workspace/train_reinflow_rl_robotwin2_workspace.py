@@ -248,8 +248,15 @@ class TrainReinFlowRLRoboTwinWorkspace:
             return False, "critic_warmup", 1, 0.0
 
         min_success = float(self.cfg.rl.ppo.get("min_success_rate_for_actor_update", 0.0))
-        if bool(self.cfg.rl.ppo.get("skip_actor_update_on_zero_success", True)) and success_rate <= min_success:
-            return False, "zero_success_rollout", 2, 0.0
+        low_success = success_rate < min_success if min_success > 0.0 else success_rate <= 0.0
+        skip_low_success = bool(
+            self.cfg.rl.ppo.get(
+                "skip_actor_update_on_low_success",
+                self.cfg.rl.ppo.get("skip_actor_update_on_zero_success", True),
+            )
+        )
+        if skip_low_success and low_success:
+            return False, "low_success_rollout", 2, 0.0
 
         min_raw_reward = float(self.cfg.rl.ppo.get("min_raw_reward_for_actor_update", 0.0))
         if bool(self.cfg.rl.ppo.get("skip_actor_update_on_zero_reward", False)) and raw_reward_sum <= min_raw_reward:
@@ -257,12 +264,23 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
         downweight_reasons = []
         downweight_code = 0
-        if bool(self.cfg.rl.ppo.get("downweight_actor_update_on_zero_success", False)) and success_rate <= min_success:
+        downweight_low_success = bool(
+            self.cfg.rl.ppo.get(
+                "downweight_actor_update_on_low_success",
+                self.cfg.rl.ppo.get("downweight_actor_update_on_zero_success", False),
+            )
+        )
+        if downweight_low_success and low_success:
             actor_loss_scale = min(
                 actor_loss_scale,
-                float(self.cfg.rl.ppo.get("zero_success_actor_loss_scale", 0.25)),
+                float(
+                    self.cfg.rl.ppo.get(
+                        "low_success_actor_loss_scale",
+                        self.cfg.rl.ppo.get("zero_success_actor_loss_scale", 0.25),
+                    )
+                ),
             )
-            downweight_reasons.append("zero_success_downweighted")
+            downweight_reasons.append("low_success_downweighted")
             downweight_code = max(downweight_code, 4)
 
         if bool(self.cfg.rl.ppo.get("downweight_actor_update_on_zero_reward", False)) and raw_reward_sum <= min_raw_reward:
@@ -380,88 +398,116 @@ class TrainReinFlowRLRoboTwinWorkspace:
     ):
         buffer.update(self._obs_to_buffer(self.current_obs), self.critic)
         obs, chains, returns, values, advantages, logprobs = buffer.make_dataset()
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
         explained_var = buffer.get_explained_var(values, returns)
         total_steps = returns.shape[0]
         expected_steps = buffer.n_steps * buffer.n_envs
         if total_steps != expected_steps:
             raise RuntimeError(f"PPO dataset has {total_steps} steps, expected {expected_steps}")
         batch_size = int(self.cfg.rl.ppo.batch_size)
+        grad_accum_steps = int(self.cfg.rl.ppo.get("grad_accum_steps", 1))
+        if grad_accum_steps < 1:
+            raise ValueError(f"rl.ppo.grad_accum_steps must be >= 1, got {grad_accum_steps}")
         update_epochs = int(self.cfg.rl.ppo.update_epochs)
         target_kl = self.cfg.rl.ppo.target_kl
         actor_update_enabled = bool(update_actor) and self.itr >= int(self.cfg.rl.ppo.critic_warmup_iterations)
         actor_loss_scale = max(0.0, min(1.0, float(actor_loss_scale)))
+        actor_grad_params = list(self.ppo_actor.actor_parameters()) if actor_update_enabled else []
+        minibatch_starts = list(range(0, total_steps, batch_size))
 
         self.ppo_actor.eval()
         self.critic.train()
         metrics = []
         stopped_by_kl = False
+        optimizer_steps = 0
         for _ in range(update_epochs):
             indices = torch.randperm(total_steps)
-            for start in range(0, total_steps, batch_size):
-                mb_idx = indices[start : start + batch_size]
-                mb_obs = {k: v[mb_idx].to(self.device, non_blocking=True) for k, v in obs.items()}
-                mb_returns = returns[mb_idx].to(self.device, non_blocking=True)
-                mb_values = values[mb_idx].to(self.device, non_blocking=True)
-
-                with torch.cuda.amp.autocast(enabled=bool(self.cfg.rl.ppo.use_amp and self.device.type == "cuda")):
-                    if actor_update_enabled:
-                        mb_chains = chains[mb_idx].to(self.device, non_blocking=True)
-                        mb_adv = advantages[mb_idx].to(self.device, non_blocking=True)
-                        mb_logprobs = logprobs[mb_idx].to(self.device, non_blocking=True)
-                        loss_dict = self.ppo_actor.loss(
-                            mb_obs,
-                            mb_chains,
-                            mb_returns,
-                            mb_values,
-                            mb_adv,
-                            mb_logprobs,
-                            critic=self.critic,
-                            use_bc_loss=bool(self.cfg.rl.bc_anchor.enabled),
-                        )
-                        actor_rl_loss = loss_dict["pg_loss"] + self.cfg.rl.ppo.ent_coef * loss_dict["entropy_loss"]
-                        bc_loss = self.cfg.rl.bc_anchor.coeff * loss_dict["bc_loss"]
-                        loss = (
-                            actor_loss_scale * actor_rl_loss
-                            + self.cfg.rl.ppo.vf_coef * loss_dict["value_loss"]
-                            + bc_loss
-                        )
-                    else:
-                        newvalues = self.critic(mb_obs).view(-1)
-                        if self.ppo_actor.clip_vloss_coef is None:
-                            value_loss = 0.5 * ((newvalues - mb_returns) ** 2).mean()
-                        else:
-                            v_clipped = mb_values + torch.clamp(
-                                newvalues - mb_values,
-                                -self.ppo_actor.clip_vloss_coef,
-                                self.ppo_actor.clip_vloss_coef,
-                            )
-                            value_loss = 0.5 * torch.max(
-                                (newvalues - mb_returns) ** 2,
-                                (v_clipped - mb_returns) ** 2,
-                            ).mean()
-                        zero = value_loss.detach() * 0.0
-                        loss_dict = {
-                            "pg_loss": zero,
-                            "entropy_loss": zero,
-                            "value_loss": value_loss,
-                            "bc_loss": zero,
-                            "approx_kl": zero,
-                            "clipfrac": zero,
-                            "ratio": zero + 1.0,
-                            "noise_std": zero,
-                        }
-                        loss = self.cfg.rl.ppo.vf_coef * value_loss
-
+            for group_start in range(0, len(minibatch_starts), grad_accum_steps):
+                group_starts = minibatch_starts[group_start : group_start + grad_accum_steps]
+                accum_divisor = float(len(group_starts))
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 self.critic_optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
+
+                for start in group_starts:
+                    mb_idx = indices[start : start + batch_size]
+                    mb_obs = {k: v[mb_idx].to(self.device, non_blocking=True) for k, v in obs.items()}
+                    mb_returns = returns[mb_idx].to(self.device, non_blocking=True)
+                    mb_values = values[mb_idx].to(self.device, non_blocking=True)
+
+                    with torch.cuda.amp.autocast(enabled=bool(self.cfg.rl.ppo.use_amp and self.device.type == "cuda")):
+                        if actor_update_enabled:
+                            mb_chains = chains[mb_idx].to(self.device, non_blocking=True)
+                            mb_adv = advantages[mb_idx].to(self.device, non_blocking=True)
+                            mb_logprobs = logprobs[mb_idx].to(self.device, non_blocking=True)
+                            loss_dict = self.ppo_actor.loss(
+                                mb_obs,
+                                mb_chains,
+                                mb_returns,
+                                mb_values,
+                                mb_adv,
+                                mb_logprobs,
+                                critic=self.critic,
+                                use_bc_loss=bool(self.cfg.rl.bc_anchor.enabled),
+                                normalize_advantages=False,
+                            )
+                            actor_rl_loss = (
+                                loss_dict["pg_loss"]
+                                + self.cfg.rl.ppo.ent_coef * loss_dict["entropy_loss"]
+                            )
+                            bc_loss = self.cfg.rl.bc_anchor.coeff * loss_dict["bc_loss"]
+                            loss = (
+                                actor_loss_scale * actor_rl_loss
+                                + self.cfg.rl.ppo.vf_coef * loss_dict["value_loss"]
+                                + bc_loss
+                            )
+                        else:
+                            newvalues = self.critic(mb_obs).view(-1)
+                            if self.ppo_actor.clip_vloss_coef is None:
+                                value_loss = 0.5 * ((newvalues - mb_returns) ** 2).mean()
+                            else:
+                                v_clipped = mb_values + torch.clamp(
+                                    newvalues - mb_values,
+                                    -self.ppo_actor.clip_vloss_coef,
+                                    self.ppo_actor.clip_vloss_coef,
+                                )
+                                value_loss = 0.5 * torch.max(
+                                    (newvalues - mb_returns) ** 2,
+                                    (v_clipped - mb_returns) ** 2,
+                                ).mean()
+                            zero = value_loss.detach() * 0.0
+                            loss_dict = {
+                                "pg_loss": zero,
+                                "entropy_loss": zero,
+                                "value_loss": value_loss,
+                                "bc_loss": zero,
+                                "approx_kl": zero,
+                                "clipfrac": zero,
+                                "ratio": zero + 1.0,
+                                "noise_std": zero,
+                            }
+                            loss = self.cfg.rl.ppo.vf_coef * value_loss
+
+                    self.scaler.scale(loss / accum_divisor).backward()
+
+                    item = {
+                        k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v)
+                        for k, v in loss_dict.items()
+                    }
+                    item["loss"] = float(loss.detach().cpu())
+                    item["actor_loss_scale"] = actor_loss_scale if actor_update_enabled else 0.0
+                    metrics.append(item)
+                    if actor_update_enabled and target_kl is not None and item["approx_kl"] > float(target_kl):
+                        stopped_by_kl = True
+                        break
+
                 if self.cfg.rl.ppo.max_grad_norm is not None:
                     if actor_update_enabled:
                         self.scaler.unscale_(self.actor_optimizer)
                     self.scaler.unscale_(self.critic_optimizer)
                     if actor_update_enabled:
                         torch.nn.utils.clip_grad_norm_(
-                            list(self.ppo_actor.actor_parameters()),
+                            actor_grad_params,
                             float(self.cfg.rl.ppo.max_grad_norm),
                         )
                     torch.nn.utils.clip_grad_norm_(
@@ -473,13 +519,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     self.scaler.step(self.actor_optimizer)
                 self.scaler.step(self.critic_optimizer)
                 self.scaler.update()
-
-                item = {k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v) for k, v in loss_dict.items()}
-                item["loss"] = float(loss.detach().cpu())
-                item["actor_loss_scale"] = actor_loss_scale if actor_update_enabled else 0.0
-                metrics.append(item)
-                if actor_update_enabled and target_kl is not None and item["approx_kl"] > float(target_kl):
-                    stopped_by_kl = True
+                optimizer_steps += 1
+                if stopped_by_kl:
                     break
             if stopped_by_kl:
                 break
@@ -490,6 +531,9 @@ class TrainReinFlowRLRoboTwinWorkspace:
         mean_metrics["loss/explained_var"] = explained_var
         mean_metrics["loss/stopped_by_kl"] = float(stopped_by_kl)
         mean_metrics["loss/actor_update_enabled"] = float(actor_update_enabled)
+        mean_metrics["loss/grad_accum_steps"] = float(grad_accum_steps)
+        mean_metrics["loss/effective_batch_size"] = float(batch_size * grad_accum_steps)
+        mean_metrics["loss/optimizer_steps"] = float(optimizer_steps)
         return mean_metrics
 
     def save_resume_checkpoint(self, tag="latest_rl", itr=None):
@@ -527,9 +571,10 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.best_eval_itr = int(payload.get("best_eval_itr", -1))
         cprint(f"[RL] Resumed RL checkpoint from {path}", "green")
 
-    def export_actor_checkpoint(self, tag="latest"):
+    def export_actor_checkpoint(self, tag="latest", itr=None):
         path = pathlib.Path(self.output_dir) / "checkpoints" / f"{tag}.ckpt"
         path.parent.mkdir(parents=True, exist_ok=True)
+        save_itr = self.itr if itr is None else int(itr)
 
         export_cfg = copy.deepcopy(self.cfg)
         OmegaConf.set_struct(export_cfg, False)
@@ -545,7 +590,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
             },
             "pickles": {
                 "global_step": dill.dumps(self.global_step),
-                "epoch": dill.dumps(self.itr),
+                "epoch": dill.dumps(save_itr),
                 "_output_dir": dill.dumps(self.output_dir),
             },
         }
@@ -591,28 +636,54 @@ class TrainReinFlowRLRoboTwinWorkspace:
         config_name = str(self._eval_cfg_value("config_name", "reinflow_rl_pointcloud_robotwin2"))
         alg_name = str(self._eval_cfg_value("alg_name", config_name))
         policy_name = str(self._eval_cfg_value("policy_name", "ManiFlow"))
+        deploy_config_policy_name = str(
+            self._eval_cfg_value("deploy_config_policy_name", policy_name.split(".", 1)[0])
+        )
         task_config = str(self._eval_cfg_value("task_config", self.cfg.task_config))
         ckpt_setting = str(self._eval_cfg_value("ckpt_setting", task_config))
         eval_seed = str(self._eval_cfg_value("seed", 0))
-        candidate_tag_base = str(self._eval_cfg_value("candidate_ckpt_tag", "eval_candidate"))
+        candidate_tag = str(self._eval_cfg_value("candidate_ckpt_tag", "eval_candidate"))
         best_tag = str(self._eval_cfg_value("best_ckpt_tag", "best"))
-        candidate_tag = candidate_tag_base
         addition_info = self._derive_addition_info(config_name)
 
-        self.export_actor_checkpoint(candidate_tag)
+        candidate_path = pathlib.Path(
+            self.export_actor_checkpoint(candidate_tag, itr=eval_iteration)
+        )
 
         log_dir = pathlib.Path(self.output_dir) / "eval_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        eval_log_path = log_dir / f"{candidate_tag_base}_itr_{eval_iteration:04d}.log"
-        result_path = pathlib.Path(self.output_dir) / "eval_results" / f"epoch_{self.itr}" / "_result.txt"
+        eval_log_path = log_dir / f"{candidate_tag}_itr_{eval_iteration:04d}.log"
+        result_path = pathlib.Path(self.output_dir) / "eval_results" / f"epoch_{eval_iteration}" / "_result.txt"
         if result_path.exists():
             result_path.unlink()
 
-        cmd = [
+        env = os.environ.copy()
+        env["PYTHONWARNINGS"] = "ignore::UserWarning"
+
+        def run_eval_subprocess(cmd, log_path: pathlib.Path, label: str):
+            cprint(
+                f"[RL Eval] itr={self.itr} running {label}; log={log_path}",
+                "yellow",
+            )
+            with log_path.open("w", encoding="utf-8") as log_file:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=ROBOTWIN_ROOT,
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"Periodic eval failed with return code {proc.returncode}. See {log_path}"
+                )
+
+        actor_cmd = [
             sys.executable,
             "script/eval_policy.py",
             "--config",
-            f"policy/{policy_name}/deploy_policy.yml",
+            f"policy/{deploy_config_policy_name}/deploy_policy.yml",
             "--overrides",
             "--config_name",
             config_name,
@@ -637,50 +708,48 @@ class TrainReinFlowRLRoboTwinWorkspace:
             "--ckpt_tag",
             candidate_tag,
         ]
-        env = os.environ.copy()
-        env["PYTHONWARNINGS"] = "ignore::UserWarning"
-        cprint(
-            f"[RL Eval] itr={self.itr} running eval with ckpt_tag={candidate_tag}; log={eval_log_path}",
-            "yellow",
-        )
-        with eval_log_path.open("w", encoding="utf-8") as log_file:
-            proc = subprocess.run(
-                cmd,
-                cwd=ROBOTWIN_ROOT,
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Periodic eval failed with return code {proc.returncode}. See {eval_log_path}"
-            )
-        if not result_path.is_file():
-            raise FileNotFoundError(f"Periodic eval did not write expected result file: {result_path}")
 
-        score = self._parse_eval_score(result_path)
-        is_best = score > self.best_eval_score
-        if is_best:
-            self.best_eval_score = score
-            self.best_eval_itr = int(eval_iteration)
-            self.export_actor_checkpoint(best_tag)
-            cprint(
-                f"[RL Eval] new best {score:.4f} at iteration {eval_iteration}; saved {best_tag}.ckpt",
-                "green",
+        try:
+            run_eval_subprocess(
+                actor_cmd,
+                eval_log_path,
+                f"actor eval without noise_head, ckpt_tag={candidate_tag}",
             )
-        else:
-            cprint(
-                f"[RL Eval] score={score:.4f}, best={self.best_eval_score:.4f} "
-                f"at iteration {self.best_eval_itr}",
-                "yellow",
-            )
+            if not result_path.is_file():
+                raise FileNotFoundError(f"Periodic actor eval did not write expected result file: {result_path}")
 
-        return {
+            score = self._parse_eval_score(result_path)
+            is_best = score > self.best_eval_score
+            if is_best:
+                self.best_eval_score = score
+                self.best_eval_itr = int(eval_iteration)
+                self.export_actor_checkpoint(best_tag, itr=eval_iteration)
+                cprint(
+                    f"[RL Eval] new actor best {score:.4f} at iteration {eval_iteration}; "
+                    f"saved {best_tag}.ckpt",
+                    "green",
+                )
+            else:
+                cprint(
+                    f"[RL Eval] actor score={score:.4f}, best={self.best_eval_score:.4f} "
+                    f"at iteration {self.best_eval_itr}",
+                    "yellow",
+                )
+        finally:
+            best_path = pathlib.Path(self.output_dir) / "checkpoints" / f"{best_tag}.ckpt"
+            if candidate_path.is_file() and candidate_path.resolve() != best_path.resolve():
+                candidate_path.unlink()
+                cprint(f"[RL Eval] removed evaluated actor candidate {candidate_path}", "yellow")
+
+        result = {
+            "eval/actor_success_rate": score,
             "eval/success_rate": score,
             "eval/is_best": float(is_best),
             "eval/best_success_rate": float(self.best_eval_score),
             "eval/best_iteration": float(self.best_eval_itr),
+        }
+        return {
+            k: v for k, v in result.items()
         }
 
     def run(self):
@@ -748,8 +817,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     or self.itr == num_iterations - 1
                 ):
                     self.save_resume_checkpoint("latest_rl", itr=self.itr + 1)
-                    if bool(cfg.rl.export_actor_checkpoint):
-                        self.export_actor_checkpoint("latest")
+                    if bool(cfg.rl.get("export_actor_checkpoint", True)):
+                        self.export_actor_checkpoint("latest", itr=self.itr + 1)
 
                 eval_interval = int(self._eval_cfg_value("interval", 0))
                 eval_enabled = bool(self._eval_cfg_value("enabled", False)) and eval_interval > 0
@@ -784,8 +853,6 @@ class TrainReinFlowRLRoboTwinWorkspace:
                 "yellow",
             )
             self.save_resume_checkpoint("latest_rl")
-            if bool(cfg.rl.export_actor_checkpoint):
-                self.export_actor_checkpoint("latest")
             raise
         finally:
             for env in envs:

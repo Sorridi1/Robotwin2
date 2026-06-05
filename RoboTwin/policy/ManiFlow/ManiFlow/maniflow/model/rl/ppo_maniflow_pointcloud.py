@@ -7,15 +7,17 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from maniflow.common.pytorch_util import dict_apply
+from maniflow.model.diffusion.positional_embedding import SinusoidalPosEmb
 from maniflow.policy.maniflow_pointcloud_policy import ManiFlowTransformerPointcloudPolicy
 
 
-class TimeIndependentNoiseHead(nn.Module):
+class TimeConditionedNoiseHead(nn.Module):
     def __init__(
         self,
         cond_dim: int,
         action_horizon: int,
         action_dim: int,
+        time_dim: int = 16,
         hidden_dims=(128, 128),
         min_std: float = 0.01,
         max_std: float = 0.05,
@@ -24,8 +26,16 @@ class TimeIndependentNoiseHead(nn.Module):
         super().__init__()
         self.action_horizon = action_horizon
         self.action_dim = action_dim
+        self.time_dim = time_dim
         self.min_std = min_std
         self.max_std = max_std
+
+        self.time_embedding = nn.Sequential(
+            SinusoidalPosEmb(time_dim),
+            nn.Linear(time_dim, time_dim * 2),
+            nn.Mish(),
+            nn.Linear(time_dim * 2, time_dim),
+        )
 
         if activation == "mish":
             act_fn = nn.Mish
@@ -35,15 +45,18 @@ class TimeIndependentNoiseHead(nn.Module):
             act_fn = nn.Tanh
 
         layers = []
-        last_dim = cond_dim
+        last_dim = cond_dim + time_dim
         for dim in hidden_dims:
             layers.extend([nn.Linear(last_dim, dim), act_fn()])
             last_dim = dim
         layers.append(nn.Linear(last_dim, action_horizon * action_dim))
         self.mlp_logvar = nn.Sequential(*layers)
 
-    def forward(self, cond_emb: torch.Tensor) -> torch.Tensor:
-        logvar = torch.tanh(self.mlp_logvar(cond_emb))
+    def forward(self, cond_emb: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        time = time.reshape(cond_emb.shape[0]).to(device=cond_emb.device, dtype=cond_emb.dtype)
+        time_emb = self.time_embedding(time).to(dtype=cond_emb.dtype)
+        noise_feature = torch.cat([time_emb, cond_emb], dim=-1)
+        logvar = torch.tanh(self.mlp_logvar(noise_feature))
         logvar_min = torch.log(
             torch.tensor(self.min_std**2, device=cond_emb.device, dtype=cond_emb.dtype)
         )
@@ -81,6 +94,7 @@ class PPOManiFlowPointcloud(nn.Module):
         account_for_initial_stochasticity: bool = True,
         noise_hidden_dims=(128, 128),
         noise_activation: str = "tanh",
+        noise_time_dim: int = 16,
         actor_old_device: str = "cpu",
         freeze_obs_encoder: bool = True,
     ):
@@ -111,10 +125,11 @@ class PPOManiFlowPointcloud(nn.Module):
         self.account_for_initial_stochasticity = account_for_initial_stochasticity
         self.freeze_obs_encoder = freeze_obs_encoder
 
-        self.noise_head = TimeIndependentNoiseHead(
+        self.noise_head = TimeConditionedNoiseHead(
             cond_dim=base_actor.obs_feature_dim,
             action_horizon=self.horizon,
             action_dim=self.action_dim,
+            time_dim=noise_time_dim,
             hidden_dims=noise_hidden_dims,
             min_std=min_logprob_denoising_std,
             max_std=max_logprob_denoising_std,
@@ -203,6 +218,7 @@ class PPOManiFlowPointcloud(nn.Module):
     def _noise_std(
         self,
         cond_emb: torch.Tensor,
+        time: torch.Tensor,
         step: int,
         learn_exploration_noise: bool,
     ) -> torch.Tensor:
@@ -214,7 +230,7 @@ class PPOManiFlowPointcloud(nn.Module):
                 dtype=cond_emb.dtype,
             )
         else:
-            std = self.noise_head(cond_emb)
+            std = self.noise_head(cond_emb, time)
         return std if learn_exploration_noise else std.detach()
 
     def _select_action_window(self, action_pred: torch.Tensor) -> torch.Tensor:
@@ -267,7 +283,7 @@ class PPOManiFlowPointcloud(nn.Module):
             if self.denoised_clip_value is not None:
                 mean = mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
 
-            std = self._noise_std(cond_emb, step, learn_exploration_noise=False)
+            std = self._noise_std(cond_emb, t, step, learn_exploration_noise=False)
             std = std.reshape(batch_size, self.horizon, self.action_dim)
             std = torch.clamp(std, min=self.min_sampling_denoising_std)
             dist = Normal(mean, std)
@@ -334,7 +350,7 @@ class PPOManiFlowPointcloud(nn.Module):
             mean = xt + vel * dt
             if self.denoised_clip_value is not None:
                 mean = mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
-            std = self._noise_std(cond_emb, step, learn_exploration_noise)
+            std = self._noise_std(cond_emb, t, step, learn_exploration_noise)
             std_means.append(std.mean())
             std = std.reshape(batch_size, self.horizon, self.action_dim)
             dist = Normal(mean, std)
@@ -359,6 +375,7 @@ class PPOManiFlowPointcloud(nn.Module):
         self,
         actor: ManiFlowTransformerPointcloudPolicy,
         obs_dict: Dict[str, torch.Tensor],
+        initial_x: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         actor_device = actor.device
         obs_on_device = dict_apply(
@@ -367,13 +384,16 @@ class PPOManiFlowPointcloud(nn.Module):
         )
         vis_cond, _ = self._encode_obs(obs_on_device, actor=actor)
         batch_size = vis_cond.shape[0]
-        x = torch.zeros(
-            batch_size,
-            actor.horizon,
-            actor.action_dim,
-            device=actor_device,
-            dtype=actor.dtype,
-        )
+        if initial_x is None:
+            x = torch.zeros(
+                batch_size,
+                actor.horizon,
+                actor.action_dim,
+                device=actor_device,
+                dtype=actor.dtype,
+            )
+        else:
+            x = initial_x.to(device=actor_device, dtype=actor.dtype)
         dt = 1.0 / self.inference_steps
         for step in range(self.inference_steps):
             t = torch.full((batch_size,), step * dt, device=actor_device, dtype=actor.dtype)
@@ -383,9 +403,19 @@ class PPOManiFlowPointcloud(nn.Module):
         return x
 
     def bc_anchor_loss(self, obs_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        current = self._deterministic_normalized_action(self.base_actor, obs_dict)
+        batch_size = next(iter(obs_dict.values())).shape[0]
+        initial_x = torch.randn(
+            batch_size,
+            self.horizon,
+            self.action_dim,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        current = self._deterministic_normalized_action(self.base_actor, obs_dict, initial_x=initial_x)
         with torch.no_grad():
-            old = self._deterministic_normalized_action(self.actor_old, obs_dict).to(current.device)
+            old = self._deterministic_normalized_action(self.actor_old, obs_dict, initial_x=initial_x).to(
+                current.device
+            )
         return F.mse_loss(current, old)
 
     def loss(
@@ -398,6 +428,7 @@ class PPOManiFlowPointcloud(nn.Module):
         oldlogprobs: torch.Tensor,
         critic: nn.Module,
         use_bc_loss: bool = False,
+        normalize_advantages: bool = True,
     ) -> Dict[str, torch.Tensor]:
         newlogprobs, entropy, noise_std = self.get_logprobs(
             obs_dict,
@@ -411,7 +442,7 @@ class PPOManiFlowPointcloud(nn.Module):
         oldvalues = oldvalues.to(newlogprobs.device)
         advantages = advantages.to(newlogprobs.device)
 
-        if advantages.numel() > 1:
+        if normalize_advantages and advantages.numel() > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
 
         logratio = newlogprobs - oldlogprobs

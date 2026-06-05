@@ -158,7 +158,7 @@ rl:
     # Ant-style decomposition: progress + success + healthy - ctrl - contact - time.
     # Progress uses task.stage_reward() when available; place_empty_cup has a distance fallback.
     progress_scale: 1.0
-    success_bonus: 1.0
+    success_bonus: 1.5
     healthy: 0.0
     ctrl_cost_weight: 0.001
     ctrl_cost_mode: delta
@@ -176,7 +176,7 @@ rl:
     randn_clip_value: 2.0
     denoised_clip_value: 1.5
     final_action_clip_value: 1.0
-    clip_ploss_coef: 0.05
+    clip_ploss_coef: 0.005
     clip_vloss_coef: null
     logprob_min: -5.0
     logprob_max: 5.0
@@ -185,6 +185,7 @@ rl:
     account_for_initial_stochasticity: true
     noise_hidden_dims: [128, 128]
     noise_activation: tanh
+    noise_time_dim: 16
     actor_old_device: cuda:0
     freeze_obs_encoder: true
 
@@ -213,6 +214,7 @@ rl:
   ppo:
     num_iterations: 60
     batch_size: 4
+    grad_accum_steps: 4
     update_epochs: 2
     critic_warmup_iterations: 4
     actor_lr: 3.0e-6
@@ -225,22 +227,22 @@ rl:
     ent_coef: 0.005
     vf_coef: 0.5
     max_grad_norm: 1.0
-    target_kl: 0.03
+    target_kl: 0.01
     reward_scale_running: true
     reward_scale_const: 1.0
     bootstrap_on_truncated: false
     use_amp: true
-    skip_actor_update_on_zero_success: false
+    skip_actor_update_on_low_success: false
     skip_actor_update_on_zero_reward: false
-    min_success_rate_for_actor_update: 0.0
+    min_success_rate_for_actor_update: 0.8
     min_raw_reward_for_actor_update: 0.0
-    downweight_actor_update_on_zero_success: true
-    zero_success_actor_loss_scale: 0.2
+    downweight_actor_update_on_low_success: true
+    low_success_actor_loss_scale: 0.2
     downweight_actor_update_on_zero_reward: false
     zero_reward_actor_loss_scale: 0.25
 
   bc_anchor:
-    enabled: true
+    enabled: false
     coeff: 0.1
 
 hydra:

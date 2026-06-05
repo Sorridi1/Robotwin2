@@ -485,6 +485,10 @@ class TrainManiFlowRoboTwinWorkspace:
         if tag=='latest':
             return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
         elif tag=='best': 
+            exact_ckpt = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
+            if exact_ckpt.is_file():
+                return exact_ckpt
+
             # the checkpoints are saved as format: epoch={}-test_mean_score={}.ckpt
             # find the best checkpoint
             checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')
