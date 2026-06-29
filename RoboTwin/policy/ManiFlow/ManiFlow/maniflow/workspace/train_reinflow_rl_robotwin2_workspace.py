@@ -310,6 +310,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.ppo_actor.eval()
         self.critic.eval()
         rollout_infos = []
+        sampling_noise_stats = []
         desc = f"RL rollout itr {self.itr} ({n_envs} envs)"
         iterator = range(buffer.n_steps)
         with tqdm.tqdm(iterator, desc=desc, leave=False, mininterval=self.cfg.training.tqdm_interval_sec) as pbar:
@@ -324,6 +325,10 @@ class TrainReinFlowRLRoboTwinWorkspace:
                         save_chains=True,
                         ret_logprob=True,
                     )
+                    sampling_noise_stats.append({
+                        k: float(v.detach().cpu()) if torch.is_tensor(v) else float(v)
+                        for k, v in self.ppo_actor.last_action_noise_stats.items()
+                    })
                 if action.shape[0] != n_envs or chains.shape[0] != n_envs or logprob.shape[0] != n_envs:
                     raise RuntimeError(
                         "Batched actor output does not match n_envs: "
@@ -384,6 +389,15 @@ class TrainReinFlowRLRoboTwinWorkspace:
         summary["rollout_chunks"] = len(rollout_infos)
         summary["rollout_last_env_step"] = rollout_infos[-1].get("take_action_cnt", 0) if rollout_infos else 0
         summary["rollout_any_success_info"] = float(any(info.get("success", False) for info in rollout_infos))
+        if len(sampling_noise_stats) > 0:
+            for key in sampling_noise_stats[0]:
+                values = np.asarray([item[key] for item in sampling_noise_stats], dtype=np.float32)
+                if key in ("sigma_min_observed", "delta_min"):
+                    summary[f"sampling_{key}"] = float(np.min(values))
+                elif key in ("sigma_max_observed", "delta_max"):
+                    summary[f"sampling_{key}"] = float(np.max(values))
+                else:
+                    summary[f"sampling_{key}"] = float(np.mean(values))
         for key in ("forward", "success", "healthy", "ctrl", "contact", "time"):
             summary[f"reward_{key}_sum"] = float(
                 np.sum([info.get(f"reward_{key}", 0.0) for info in rollout_infos])
@@ -485,6 +499,17 @@ class TrainReinFlowRLRoboTwinWorkspace:
                                 "clipfrac": zero,
                                 "ratio": zero + 1.0,
                                 "noise_std": zero,
+                                "sigma_mean": zero,
+                                "sigma_min_observed": zero,
+                                "sigma_max_observed": zero,
+                                "base_sigma_mean": zero,
+                                "delta_mean": zero,
+                                "delta_abs_mean": zero,
+                                "delta_min": zero,
+                                "delta_max": zero,
+                                "clamp_ratio_min": zero,
+                                "clamp_ratio_max": zero,
+                                "value_mean": newvalues.mean().detach(),
                             }
                             loss = self.cfg.rl.ppo.vf_coef * value_loss
 
@@ -528,6 +553,32 @@ class TrainReinFlowRLRoboTwinWorkspace:
         if len(metrics) == 0:
             return {"explained_var": explained_var}
         mean_metrics = {f"loss/{k}": float(np.mean([m[k] for m in metrics])) for k in metrics[0].keys()}
+        for key in (
+            "sigma_mean",
+            "sigma_min_observed",
+            "sigma_max_observed",
+            "base_sigma_mean",
+            "delta_mean",
+            "delta_abs_mean",
+            "delta_min",
+            "delta_max",
+            "clamp_ratio_min",
+            "clamp_ratio_max",
+        ):
+            if f"loss/{key}" in mean_metrics:
+                mean_metrics[f"noise/{key}"] = mean_metrics[f"loss/{key}"]
+        backbone_ids = {"fixed": -1.0, "mlp": 0.0, "tcn": 1.0, "transformer": 2.0}
+        schedule_ids = {"constant": 0.0, "linear": 1.0, "cosine": 2.0}
+        mean_metrics["noise/backbone_id"] = backbone_ids.get(
+            getattr(self.ppo_actor, "noise_backbone", "fixed")
+            if getattr(self.ppo_actor, "noise_head_type", "fixed") == "residual_schedule"
+            else "fixed",
+            -1.0,
+        )
+        mean_metrics["noise/base_schedule_id"] = schedule_ids.get(
+            getattr(self.ppo_actor, "base_sigma_schedule", "constant"),
+            -1.0,
+        )
         mean_metrics["loss/explained_var"] = explained_var
         mean_metrics["loss/stopped_by_kl"] = float(stopped_by_kl)
         mean_metrics["loss/actor_update_enabled"] = float(actor_update_enabled)
@@ -808,6 +859,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     f"succ={step_log.get('rollout/success_rate', 0):.3f} "
                     f"raw_reward={step_log.get('rollout/rollout_raw_reward_sum', 0):.3f} "
                     f"actor_update={int(update_actor)}({actor_skip_reason}, scale={actor_loss_scale:.2f}) "
+                    f"sigma={step_log.get('loss/sigma_mean', 0):.4f} "
                     f"loss={step_log.get('loss/loss', 0):.4f}",
                     "cyan",
                 )

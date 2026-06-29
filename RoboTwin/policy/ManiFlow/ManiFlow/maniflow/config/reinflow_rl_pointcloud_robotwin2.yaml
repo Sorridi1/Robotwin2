@@ -176,7 +176,7 @@ rl:
     randn_clip_value: 2.0
     denoised_clip_value: 1.5
     final_action_clip_value: 1.0
-    clip_ploss_coef: 0.005
+    clip_ploss_coef: 0.02
     clip_vloss_coef: null
     logprob_min: -5.0
     logprob_max: 5.0
@@ -184,8 +184,33 @@ rl:
     normalize_act_space_dimension: true
     account_for_initial_stochasticity: true
     noise_hidden_dims: [128, 128]
-    noise_activation: tanh
+    noise_activation: tanh              # fixed noise head keeps the previous activation
+    residual_noise_activation: mish     # residual_schedule noise head default/recommended activation
     noise_time_dim: 16
+    # fixed keeps the previous time-conditioned noise head behavior.
+    # residual_schedule enables action-conditioned residual schedule adaptive exploration:
+    # sigma = clamp(sigma_base(k) * exp(residual_scale * tanh(h(o,t,x))), sigma_min, sigma_max)
+    noise_head_type: residual_schedule  # fixed(无xt参与) 或 residual_schedule(xt参与,网络预测偏移量并和base组合)
+    noise_backbone: tcn                 # mlp / tcn / transformer, only used by residual_schedule
+    base_sigma_schedule: linear         # constant / linear / cosine
+    base_sigma: 0.02
+    base_sigma_min: 0.006
+    base_sigma_max: 0.035
+    sigma_min: 0.003
+    sigma_max: 0.06
+    residual_scale: 0.5
+    action_conditioned_noise: true
+    noise_output_mode: full             # full / chunk_shared / dim_shared
+    noise_model_dim: 128
+    noise_action_embed_dim: 64
+    zero_init_noise_output: true
+    use_horizon_pos_emb: true
+    tcn_kernel_size: 3
+    tcn_num_layers: 2
+    transformer_num_layers: 1
+    transformer_num_heads: 4
+    transformer_ffn_dim: 256
+    transformer_dropout: 0.0            # keep 0 for deterministic get_actions/get_logprobs distribution
     actor_old_device: cuda:0
     freeze_obs_encoder: true
 
@@ -212,7 +237,7 @@ rl:
     buffer_device: cpu
 
   ppo:
-    num_iterations: 60
+    num_iterations: 100
     batch_size: 4
     grad_accum_steps: 4
     update_epochs: 2
@@ -227,22 +252,22 @@ rl:
     ent_coef: 0.005
     vf_coef: 0.5
     max_grad_norm: 1.0
-    target_kl: 0.01
+    target_kl: 0.02
     reward_scale_running: true
     reward_scale_const: 1.0
     bootstrap_on_truncated: false
     use_amp: true
     skip_actor_update_on_low_success: false
     skip_actor_update_on_zero_reward: false
-    min_success_rate_for_actor_update: 0.8
+    min_success_rate_for_actor_update: 0.75
     min_raw_reward_for_actor_update: 0.0
     downweight_actor_update_on_low_success: true
-    low_success_actor_loss_scale: 0.2
+    low_success_actor_loss_scale: 0.4
     downweight_actor_update_on_zero_reward: false
     zero_reward_actor_loss_scale: 0.25
 
   bc_anchor:
-    enabled: false
+    enabled: true
     coeff: 0.1
 
 hydra:
