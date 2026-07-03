@@ -191,7 +191,7 @@ rl:
     # residual_schedule enables action-conditioned residual schedule adaptive exploration:
     # sigma = clamp(sigma_base(k) * exp(residual_scale * tanh(h(o,t,x))), sigma_min, sigma_max)
     noise_head_type: residual_schedule  # fixed(无xt参与) 或 residual_schedule(xt参与,网络预测偏移量并和base组合)
-    noise_backbone: tcn                 # mlp / tcn / transformer, only used by residual_schedule
+    noise_backbone: tcn         # mlp / tcn / transformer, only used by residual_schedule
     base_sigma_schedule: linear         # constant / linear / cosine
     base_sigma: 0.02
     base_sigma_min: 0.006

@@ -789,12 +789,6 @@ class PPOManiFlowPointcloud(nn.Module):
                 xt = mean
             else:
                 xt = dist.sample()
-                xt = xt.clamp(
-                    dist.loc - self.randn_clip_value * dist.scale,
-                    dist.loc + self.randn_clip_value * dist.scale,
-                )
-            if step == self.inference_steps - 1 and self.final_action_clip_value is not None:
-                xt = xt.clamp(-self.final_action_clip_value, self.final_action_clip_value)
             if ret_logprob:
                 logprob = logprob + dist.log_prob(xt).sum(dim=(-2, -1))
                 logprob_steps += 1
@@ -808,7 +802,10 @@ class PPOManiFlowPointcloud(nn.Module):
             if self.normalize_act_space_dimension:
                 logprob = logprob / self.act_dim_total
 
-        action_pred = self.base_actor.normalizer["action"].unnormalize(xt)
+        action_xt = xt
+        if self.final_action_clip_value is not None:
+            action_xt = action_xt.clamp(-self.final_action_clip_value, self.final_action_clip_value)
+        action_pred = self.base_actor.normalizer["action"].unnormalize(action_xt)
         action = self._select_action_window(action_pred)
         if save_chains and ret_logprob:
             return action, chains, logprob
