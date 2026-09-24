@@ -56,6 +56,13 @@ def get_model(usr_args):
     exp_name = f"{task_name}-{alg_name}-{addition_info}"
     run_dir = os.path.join("/media/Elements1/ljj/ManiFlow/outputs", exp_name + f"_seed{seed}")
 
+    # Evaluate with the configuration that created the checkpoint. Reusing the
+    # repository's current YAML can silently change architecture, inference
+    # steps, and even the RNG stream when new modules are added later.
+    archived_config_path = os.path.join(run_dir, ".hydra", "config.yaml")
+    if os.path.isfile(archived_config_path):
+        cfg = OmegaConf.load(archived_config_path)
+        print(f"Using archived training config: {archived_config_path}")
 
     hydra_runtime_cfg = {
         "job": {

@@ -67,6 +67,19 @@ policy:
     normal_channel: false
     num_points: ${policy.visual_cond_len} 
     pointwise: true
+
+  action_plan:
+    enabled: true
+    target_mode: lowpass       # lowpass / identity (raw-action predictor baseline)
+    lowpass_kernel_size: 3
+    preserve_dims: []          # e.g. binary gripper dimensions
+    predictor_hidden_dims: [256, 256]
+    loss_type: l1              # l1 / mse
+    loss_coef: 1.0
+    detach_visual_input: true
+    detach_for_flow: true
+    injection: additive
+    output_mode: flow          # flow / plan_only
     
 
 ema:
@@ -106,7 +119,7 @@ training:
   resume: True
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 700
+  num_epochs: 510
   gradient_accumulate_every: 1
   use_ema: True
   rollout_every: 500
