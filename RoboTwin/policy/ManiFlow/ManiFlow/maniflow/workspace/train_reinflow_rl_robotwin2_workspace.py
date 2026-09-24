@@ -509,6 +509,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
                                 "delta_max": zero,
                                 "clamp_ratio_min": zero,
                                 "clamp_ratio_max": zero,
+                                "reference_residual_abs_mean": zero,
+                                "reference_residual_l2_mean": zero,
                                 "value_mean": newvalues.mean().detach(),
                             }
                             loss = self.cfg.rl.ppo.vf_coef * value_loss
@@ -564,6 +566,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
             "delta_max",
             "clamp_ratio_min",
             "clamp_ratio_max",
+            "reference_residual_abs_mean",
+            "reference_residual_l2_mean",
         ):
             if f"loss/{key}" in mean_metrics:
                 mean_metrics[f"noise/{key}"] = mean_metrics[f"loss/{key}"]
@@ -611,7 +615,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
         payload = torch.load(open(path, "rb"), pickle_module=dill, map_location="cpu")
         self.itr = int(payload["itr"])
         self.global_step = int(payload.get("global_step", 0))
-        self.ppo_actor.load_state_dict(payload["ppo_actor"], strict=False)
+        self.ppo_actor.load_state_dict(payload["ppo_actor"], strict=True)
         self.critic.load_state_dict(payload["critic"])
         self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
         self.critic_optimizer.load_state_dict(payload["critic_optimizer"])

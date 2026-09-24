@@ -12,6 +12,45 @@ from maniflow.model.diffusion.positional_embedding import SinusoidalPosEmb
 from maniflow.policy.maniflow_pointcloud_policy import ManiFlowTransformerPointcloudPolicy
 
 
+def _expand_flow_time(time: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    if reference.ndim != 3:
+        raise ValueError(f"Expected reference tensor [B,H,Da], got {tuple(reference.shape)}")
+    if not torch.is_tensor(time):
+        time = torch.as_tensor(time, device=reference.device, dtype=reference.dtype)
+    time = time.to(device=reference.device, dtype=reference.dtype)
+    if time.ndim == 0:
+        time = time.expand(reference.shape[0])
+    if time.ndim != 1 or time.shape[0] != reference.shape[0]:
+        raise ValueError(f"Expected time scalar or [B], got {tuple(time.shape)}")
+    return time.view(reference.shape[0], 1, 1)
+
+
+def compute_reference_flow_state(
+    x0: torch.Tensor,
+    plan: torch.Tensor,
+    time: torch.Tensor,
+) -> torch.Tensor:
+    """Compute Xbar_k^P=(1-t_k)X0+t_k P with shape [B,H,Da]."""
+    if x0.shape != plan.shape or x0.ndim != 3:
+        raise ValueError(
+            f"Expected matching x0/plan [B,H,Da], got {tuple(x0.shape)} and {tuple(plan.shape)}"
+        )
+    t = _expand_flow_time(time, x0)
+    return (1.0 - t) * x0 + t * plan.to(device=x0.device, dtype=x0.dtype)
+
+
+def compute_reference_residual(
+    xk: torch.Tensor,
+    x0: torch.Tensor,
+    plan: torch.Tensor,
+    time: torch.Tensor,
+) -> torch.Tensor:
+    """Compute R_k=X_k-Xbar_k^P without modifying stored chain tensors."""
+    if xk.shape != x0.shape:
+        raise ValueError(f"Expected xk/x0 shape match, got {tuple(xk.shape)} and {tuple(x0.shape)}")
+    return xk - compute_reference_flow_state(x0, plan, time)
+
+
 class TimeConditionedNoiseHead(nn.Module):
     def __init__(
         self,
@@ -197,6 +236,7 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         residual_scale: float = 0.5,
         zero_init_output: bool = True,
         use_horizon_pos_emb: bool = True,
+        noise_conditioning_mode: str = "default",
     ):
         super().__init__()
         if noise_output_mode not in ("full", "chunk_shared", "dim_shared"):
@@ -214,6 +254,11 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         self.noise_backbone = noise_backbone
         self.residual_scale = float(residual_scale)
         self.use_horizon_pos_emb = bool(use_horizon_pos_emb)
+        self.noise_conditioning_mode = str(noise_conditioning_mode)
+        if self.noise_conditioning_mode not in ("default", "plan", "reference_flow"):
+            raise ValueError(
+                f"Unsupported noise_conditioning_mode={self.noise_conditioning_mode}"
+            )
 
         self.time_embedding = nn.Sequential(
             SinusoidalPosEmb(time_dim),
@@ -232,6 +277,13 @@ class ActionConditionedResidualNoiseHead(nn.Module):
             )
         else:
             self.action_proj = None
+
+        self.plan_proj = None
+        self.reference_residual_proj = None
+        if self.noise_conditioning_mode in ("plan", "reference_flow"):
+            self.plan_proj = nn.Linear(action_dim, self.model_dim)
+        if self.noise_conditioning_mode == "reference_flow":
+            self.reference_residual_proj = nn.Linear(action_dim, self.model_dim)
 
         if self.use_horizon_pos_emb:
             self.horizon_pos_emb = nn.Parameter(torch.zeros(1, self.action_horizon, self.model_dim))
@@ -271,6 +323,8 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         cond_emb: torch.Tensor,
         time: torch.Tensor,
         x: torch.Tensor,
+        plan_cond: Optional[torch.Tensor] = None,
+        reference_residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, horizon, action_dim = x.shape
         if horizon != self.action_horizon or action_dim != self.action_dim:
@@ -287,6 +341,20 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         z = cond_token + time_token
         if self.action_conditioned_noise:
             z = z + self.action_proj(x)
+        if self.plan_proj is not None:
+            if plan_cond is None or plan_cond.shape != x.shape:
+                actual = None if plan_cond is None else tuple(plan_cond.shape)
+                raise ValueError(f"Expected plan_cond shape {tuple(x.shape)}, got {actual}")
+            z = z + self.plan_proj(plan_cond.to(device=x.device, dtype=x.dtype))
+        if self.reference_residual_proj is not None:
+            if reference_residual is None or reference_residual.shape != x.shape:
+                actual = None if reference_residual is None else tuple(reference_residual.shape)
+                raise ValueError(
+                    f"Expected reference_residual shape {tuple(x.shape)}, got {actual}"
+                )
+            z = z + self.reference_residual_proj(
+                reference_residual.to(device=x.device, dtype=x.dtype)
+            )
         if self.horizon_pos_emb is not None:
             z = z + self.horizon_pos_emb.to(device=x.device, dtype=x.dtype)
         return self.token_norm(z)
@@ -296,9 +364,14 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         cond_emb: torch.Tensor,
         time: torch.Tensor,
         x: torch.Tensor,
+        plan_cond: Optional[torch.Tensor] = None,
+        reference_residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, horizon, action_dim = x.shape
-        z = self._build_tokens(cond_emb, time, x)
+        z = self._build_tokens(
+            cond_emb, time, x, plan_cond=plan_cond,
+            reference_residual=reference_residual,
+        )
         y = self.backbone(z)
         if self.noise_output_mode == "chunk_shared":
             y = y.mean(dim=1, keepdim=True)
@@ -315,8 +388,13 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         cond_emb: torch.Tensor,
         time: torch.Tensor,
         x: torch.Tensor,
+        plan_cond: Optional[torch.Tensor] = None,
+        reference_residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        raw_delta = self.forward_raw(cond_emb, time, x)
+        raw_delta = self.forward_raw(
+            cond_emb, time, x, plan_cond=plan_cond,
+            reference_residual=reference_residual,
+        )
         return self.residual_scale * torch.tanh(raw_delta)
 
     def forward(
@@ -324,11 +402,19 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         cond_emb: torch.Tensor,
         time: torch.Tensor,
         x: torch.Tensor,
+        plan_cond: Optional[torch.Tensor] = None,
+        reference_residual: Optional[torch.Tensor] = None,
         return_raw: bool = False,
     ) -> torch.Tensor:
         if return_raw:
-            return self.forward_raw(cond_emb, time, x)
-        return self.predict_delta(cond_emb, time, x)
+            return self.forward_raw(
+                cond_emb, time, x, plan_cond=plan_cond,
+                reference_residual=reference_residual,
+            )
+        return self.predict_delta(
+            cond_emb, time, x, plan_cond=plan_cond,
+            reference_residual=reference_residual,
+        )
 
 
 class PPOManiFlowPointcloud(nn.Module):
@@ -381,6 +467,7 @@ class PPOManiFlowPointcloud(nn.Module):
         transformer_dropout: float = 0.0,
         zero_init_noise_output: bool = True,
         use_horizon_pos_emb: bool = True,
+        noise_conditioning_mode: str = "default",
         actor_old_device: str = "cpu",
         freeze_obs_encoder: bool = True,
     ):
@@ -425,6 +512,7 @@ class PPOManiFlowPointcloud(nn.Module):
         self.residual_scale = float(residual_scale)
         self.action_conditioned_noise = bool(action_conditioned_noise)
         self.noise_output_mode = str(noise_output_mode)
+        self.noise_conditioning_mode = str(noise_conditioning_mode)
         self.last_logprob_noise_stats = {}
         self.last_action_noise_stats = {}
 
@@ -435,6 +523,19 @@ class PPOManiFlowPointcloud(nn.Module):
         if self.sigma_min <= 0 or self.sigma_max <= 0 or self.sigma_min > self.sigma_max:
             raise ValueError(
                 f"Invalid sigma clamp bounds: sigma_min={self.sigma_min}, sigma_max={self.sigma_max}"
+            )
+        if self.noise_conditioning_mode not in ("default", "plan", "reference_flow"):
+            raise ValueError(
+                f"Unsupported noise_conditioning_mode={self.noise_conditioning_mode}"
+            )
+        if self.noise_conditioning_mode != "default" and not base_actor.action_plan_enabled:
+            raise ValueError(
+                f"noise_conditioning_mode={self.noise_conditioning_mode} requires action_plan.enabled=true"
+            )
+        if self.noise_conditioning_mode != "default" and self.noise_head_type != "residual_schedule":
+            raise ValueError(
+                f"noise_conditioning_mode={self.noise_conditioning_mode} requires "
+                "noise_head_type=residual_schedule"
             )
 
         if self.noise_head_type == "fixed":
@@ -470,7 +571,12 @@ class PPOManiFlowPointcloud(nn.Module):
                 residual_scale=residual_scale,
                 zero_init_output=zero_init_noise_output,
                 use_horizon_pos_emb=use_horizon_pos_emb,
+                noise_conditioning_mode=self.noise_conditioning_mode,
             )
+
+        if base_actor.action_plan_enabled:
+            base_actor.plan_predictor.eval()
+            base_actor.plan_predictor.requires_grad_(False)
 
         actor_old = copy.deepcopy(base_actor).to(actor_old_device)
         actor_old.eval()
@@ -481,6 +587,14 @@ class PPOManiFlowPointcloud(nn.Module):
         if self.freeze_obs_encoder:
             for param in self.base_actor.obs_encoder.parameters():
                 param.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # PPO never updates P_phi; keep it deterministic even when the wrapper trains.
+        if self.base_actor.action_plan_enabled:
+            self.base_actor.plan_predictor.eval()
+        self.actor_old.eval()
+        return self
 
     @property
     def device(self):
@@ -536,12 +650,22 @@ class PPOManiFlowPointcloud(nn.Module):
             return t + dt
         return torch.ones_like(t) * dt
 
+    def _predict_plan(
+        self,
+        actor: ManiFlowTransformerPointcloudPolicy,
+        vis_cond: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not getattr(actor, "action_plan_enabled", False):
+            return None
+        return actor.predict_action_plan(vis_cond, detach_visual=True).detach()
+
     def _velocity(
         self,
         actor: ManiFlowTransformerPointcloudPolicy,
         x: torch.Tensor,
         t: torch.Tensor,
         vis_cond: torch.Tensor,
+        plan_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         dt = 1.0 / self.inference_steps
         return actor.model(
@@ -549,6 +673,7 @@ class PPOManiFlowPointcloud(nn.Module):
             timestep=t,
             target_t=self._target_t(t, dt, actor),
             vis_cond=vis_cond,
+            plan_cond=plan_cond,
         )
 
     def compute_base_sigma(
@@ -593,6 +718,7 @@ class PPOManiFlowPointcloud(nn.Module):
         sigma: torch.Tensor,
         base_sigma: torch.Tensor,
         delta: torch.Tensor,
+        reference_residual: Optional[torch.Tensor] = None,
         clamp_ratio_min: Optional[torch.Tensor] = None,
         clamp_ratio_max: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -600,6 +726,12 @@ class PPOManiFlowPointcloud(nn.Module):
             clamp_ratio_min = torch.zeros((), device=sigma.device, dtype=sigma.dtype)
         if clamp_ratio_max is None:
             clamp_ratio_max = torch.zeros((), device=sigma.device, dtype=sigma.dtype)
+        if reference_residual is None:
+            residual_abs_mean = torch.zeros((), device=sigma.device, dtype=sigma.dtype)
+            residual_l2_mean = torch.zeros((), device=sigma.device, dtype=sigma.dtype)
+        else:
+            residual_abs_mean = reference_residual.abs().mean()
+            residual_l2_mean = torch.linalg.vector_norm(reference_residual, dim=-1).mean()
         return {
             "sigma_mean": sigma.mean(),
             "sigma_min_observed": sigma.amin(),
@@ -611,6 +743,8 @@ class PPOManiFlowPointcloud(nn.Module):
             "delta_max": delta.amax(),
             "clamp_ratio_min": clamp_ratio_min,
             "clamp_ratio_max": clamp_ratio_max,
+            "reference_residual_abs_mean": residual_abs_mean,
+            "reference_residual_l2_mean": residual_l2_mean,
         }
 
     def _aggregate_noise_stats(self, stats: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -627,6 +761,8 @@ class PPOManiFlowPointcloud(nn.Module):
                 "delta_max": zero,
                 "clamp_ratio_min": zero,
                 "clamp_ratio_max": zero,
+                "reference_residual_abs_mean": zero,
+                "reference_residual_l2_mean": zero,
             }
 
         out = {}
@@ -647,9 +783,17 @@ class PPOManiFlowPointcloud(nn.Module):
         x: torch.Tensor,
         step: Optional[int] = None,
         learn_exploration_noise: bool = True,
+        plan_cond: Optional[torch.Tensor] = None,
+        reference_residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         base_sigma = self.compute_base_sigma(time, x, step=step)
-        delta = self.noise_head.predict_delta(cond_emb, time, x)
+        delta = self.noise_head.predict_delta(
+            cond_emb,
+            time,
+            x,
+            plan_cond=plan_cond,
+            reference_residual=reference_residual,
+        )
         pre_clamp_sigma = base_sigma * torch.exp(delta)
         clamp_ratio_min = (pre_clamp_sigma < self.sigma_min).to(dtype=x.dtype).mean()
         clamp_ratio_max = (pre_clamp_sigma > self.sigma_max).to(dtype=x.dtype).mean()
@@ -677,6 +821,8 @@ class PPOManiFlowPointcloud(nn.Module):
         x: torch.Tensor,
         step: int,
         learn_exploration_noise: bool,
+        plan_cond: Optional[torch.Tensor] = None,
+        reference_residual: Optional[torch.Tensor] = None,
         return_stats: bool = False,
     ):
         if step < self.learn_explore_noise_from:
@@ -699,6 +845,8 @@ class PPOManiFlowPointcloud(nn.Module):
                 x,
                 step=step,
                 learn_exploration_noise=learn_exploration_noise,
+                plan_cond=plan_cond,
+                reference_residual=reference_residual,
             )
             base_sigma = sigma_info["base_sigma"]
             delta = sigma_info["delta"]
@@ -716,10 +864,25 @@ class PPOManiFlowPointcloud(nn.Module):
                 std,
                 base_sigma,
                 delta,
+                reference_residual=reference_residual,
                 clamp_ratio_min=clamp_ratio_min,
                 clamp_ratio_max=clamp_ratio_max,
             )
         return std
+
+    def _finalize_step_noise_stats(
+        self,
+        stats: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        aggregated = self._aggregate_noise_stats(stats)
+        for step, item in enumerate(stats):
+            if "sigma_mean" in item:
+                aggregated[f"sigma_step_{step}"] = item["sigma_mean"]
+            if "reference_residual_abs_mean" in item:
+                aggregated[f"reference_residual_step_{step}"] = item[
+                    "reference_residual_abs_mean"
+                ]
+        return aggregated
 
     def get_last_noise_stats(self) -> Dict[str, torch.Tensor]:
         return self.last_logprob_noise_stats
@@ -739,6 +902,7 @@ class PPOManiFlowPointcloud(nn.Module):
     ):
         obs_dict = self._to_actor_device(obs_dict)
         vis_cond, cond_emb = self._encode_obs(obs_dict)
+        plan_cond = self._predict_plan(self.base_actor, vis_cond)
         batch_size = cond_emb.shape[0]
         dt = 1.0 / self.inference_steps
 
@@ -749,6 +913,8 @@ class PPOManiFlowPointcloud(nn.Module):
             device=self.device,
             dtype=self.dtype,
         )
+        # The stage-aligned reference must use this exact rollout chain's X0.
+        x0 = xt.clone()
         if save_chains:
             chains = torch.empty(
                 batch_size,
@@ -759,7 +925,6 @@ class PPOManiFlowPointcloud(nn.Module):
                 dtype=self.dtype,
             )
             chains[:, 0] = xt
-
         logprob = torch.zeros(batch_size, device=self.device, dtype=self.dtype)
         logprob_steps = 0
         noise_stats = []
@@ -770,18 +935,34 @@ class PPOManiFlowPointcloud(nn.Module):
 
         for step in range(self.inference_steps):
             t = torch.full((batch_size,), step * dt, device=self.device, dtype=self.dtype)
-            vel = self._velocity(self.base_actor, xt, t, vis_cond)
+            if plan_cond is None:
+                vel = self._velocity(self.base_actor, xt, t, vis_cond)
+            else:
+                vel = self._velocity(
+                    self.base_actor, xt, t, vis_cond, plan_cond=plan_cond
+                )
             mean = xt + vel * dt
             if self.denoised_clip_value is not None:
                 mean = mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
 
+            reference_residual = None
+            noise_conditioning_mode = getattr(
+                self, "noise_conditioning_mode", "default"
+            )
+            if noise_conditioning_mode == "reference_flow":
+                reference_residual = compute_reference_residual(
+                    xt, x0, plan_cond, t
+                )
+            noise_kwargs = {}
+            if noise_conditioning_mode in ("plan", "reference_flow"):
+                noise_kwargs["plan_cond"] = plan_cond
+            if noise_conditioning_mode == "reference_flow":
+                noise_kwargs["reference_residual"] = reference_residual
             std, step_noise_stats = self._noise_std(
-                cond_emb,
-                t,
-                xt,
-                step,
+                cond_emb, t, xt, step,
                 learn_exploration_noise=False,
                 return_stats=True,
+                **noise_kwargs,
             )
             noise_stats.append(step_noise_stats)
             dist = Normal(mean, std)
@@ -795,7 +976,7 @@ class PPOManiFlowPointcloud(nn.Module):
             if save_chains:
                 chains[:, step + 1] = xt
 
-        self.last_action_noise_stats = self._aggregate_noise_stats(noise_stats)
+        self.last_action_noise_stats = self._finalize_step_noise_stats(noise_stats)
         if ret_logprob:
             if self.normalize_denoising_horizon and logprob_steps > 0:
                 logprob = logprob / logprob_steps
@@ -823,8 +1004,10 @@ class PPOManiFlowPointcloud(nn.Module):
         obs_dict = self._to_actor_device(obs_dict)
         chains = chains.to(device=self.device, dtype=self.dtype)
         vis_cond, cond_emb = self._encode_obs(obs_dict)
+        plan_cond = self._predict_plan(self.base_actor, vis_cond)
         batch_size = chains.shape[0]
         dt = 1.0 / self.inference_steps
+        x0 = chains[:, 0]
 
         logprob = torch.zeros(batch_size, device=self.device, dtype=self.dtype)
         entropy = torch.zeros_like(logprob)
@@ -842,17 +1025,32 @@ class PPOManiFlowPointcloud(nn.Module):
             xt = chains[:, step]
             xnext = chains[:, step + 1]
             t = torch.full((batch_size,), step * dt, device=self.device, dtype=self.dtype)
-            vel = self._velocity(self.base_actor, xt, t, vis_cond)
+            if plan_cond is None:
+                vel = self._velocity(self.base_actor, xt, t, vis_cond)
+            else:
+                vel = self._velocity(
+                    self.base_actor, xt, t, vis_cond, plan_cond=plan_cond
+                )
             mean = xt + vel * dt
             if self.denoised_clip_value is not None:
                 mean = mean.clamp(-self.denoised_clip_value, self.denoised_clip_value)
+            reference_residual = None
+            noise_conditioning_mode = getattr(
+                self, "noise_conditioning_mode", "default"
+            )
+            if noise_conditioning_mode == "reference_flow":
+                reference_residual = compute_reference_residual(
+                    xt, x0, plan_cond, t
+                )
+            noise_kwargs = {}
+            if noise_conditioning_mode in ("plan", "reference_flow"):
+                noise_kwargs["plan_cond"] = plan_cond
+            if noise_conditioning_mode == "reference_flow":
+                noise_kwargs["reference_residual"] = reference_residual
             std, step_noise_stats = self._noise_std(
-                cond_emb,
-                t,
-                xt,
-                step,
-                learn_exploration_noise,
+                cond_emb, t, xt, step, learn_exploration_noise,
                 return_stats=True,
+                **noise_kwargs,
             )
             noise_stats.append(step_noise_stats)
             dist = Normal(mean, std)
@@ -868,7 +1066,7 @@ class PPOManiFlowPointcloud(nn.Module):
             logprob = logprob / self.act_dim_total
             entropy = entropy / self.act_dim_total
 
-        self.last_logprob_noise_stats = self._aggregate_noise_stats(noise_stats)
+        self.last_logprob_noise_stats = self._finalize_step_noise_stats(noise_stats)
         std_mean = self.last_logprob_noise_stats["sigma_mean"]
         if get_entropy:
             return logprob, entropy, std_mean
@@ -886,6 +1084,7 @@ class PPOManiFlowPointcloud(nn.Module):
             lambda x: x.to(device=actor_device, dtype=actor.dtype) if torch.is_tensor(x) else x,
         )
         vis_cond, _ = self._encode_obs(obs_on_device, actor=actor)
+        plan_cond = self._predict_plan(actor, vis_cond)
         batch_size = vis_cond.shape[0]
         if initial_x is None:
             x = torch.zeros(
@@ -900,7 +1099,13 @@ class PPOManiFlowPointcloud(nn.Module):
         dt = 1.0 / self.inference_steps
         for step in range(self.inference_steps):
             t = torch.full((batch_size,), step * dt, device=actor_device, dtype=actor.dtype)
-            x = x + self._velocity(actor, x, t, vis_cond) * dt
+            if plan_cond is None:
+                velocity = self._velocity(actor, x, t, vis_cond)
+            else:
+                velocity = self._velocity(
+                    actor, x, t, vis_cond, plan_cond=plan_cond
+                )
+            x = x + velocity * dt
             if self.final_action_clip_value is not None and step == self.inference_steps - 1:
                 x = x.clamp(-self.final_action_clip_value, self.final_action_clip_value)
         return x

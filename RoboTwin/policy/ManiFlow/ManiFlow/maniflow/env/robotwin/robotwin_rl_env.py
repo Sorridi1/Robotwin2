@@ -1,6 +1,7 @@
 from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
+import gc
 import importlib
 import os
 import sys
@@ -120,6 +121,30 @@ class RoboTwinRLEnv:
         self._last_observation = None
         self._has_active_env = False
         self.base_args = self._build_task_args()
+
+    def _clear_backend_cache(self):
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _close_active_env(self, clear_cache: bool = True):
+        if self.task_env is not None:
+            try:
+                self.task_env.close_env(clear_cache=clear_cache)
+            except Exception:
+                pass
+        self._has_active_env = False
+        if clear_cache:
+            self._clear_backend_cache()
+
+    def _recreate_task_env(self):
+        self._close_active_env(clear_cache=True)
+        self.task_env = _task_env(self.task_name)
 
     def _build_task_args(self) -> Dict:
         task_cfg_path = ROBOTWIN_ROOT / "task_config" / f"{self.task_config}.yml"
@@ -305,36 +330,52 @@ class RoboTwinRLEnv:
         if seed is not None:
             self.next_seed = int(seed)
         if self._has_active_env:
-            self.task_env.close_env(clear_cache=True)
-            self._has_active_env = False
+            self._close_active_env(clear_cache=True)
 
-        valid_seed, episode_info = self._find_valid_seed(self.next_seed)
-        self.next_seed = valid_seed + 1
+        last_exc = None
+        for reset_try in range(3):
+            valid_seed, episode_info = self._find_valid_seed(self.next_seed)
+            self.next_seed = valid_seed + 1
 
-        args = dict(self.base_args)
-        self.task_env.setup_demo(
-            now_ep_num=self.episode_id,
-            seed=valid_seed,
-            is_test=True,
-            **args,
-        )
-        self._has_active_env = True
-        instruction = self._sample_instruction(episode_info)
-        if instruction is not None:
-            self.task_env.set_instruction(instruction=instruction)
+            args = dict(self.base_args)
+            try:
+                self.task_env.setup_demo(
+                    now_ep_num=self.episode_id,
+                    seed=valid_seed,
+                    is_test=True,
+                    **args,
+                )
+                self._has_active_env = True
+                instruction = self._sample_instruction(episode_info)
+                if instruction is not None:
+                    self.task_env.set_instruction(instruction=instruction)
 
-        self.obs.clear()
-        self._success_seen = False
-        self._initial_place_empty_cup_xy_dist = None
-        self._initial_place_empty_cup_z = None
-        self._last_stage_reward = self._current_stage_reward()
-        self._last_progress_value = self._current_progress_value()
-        observation = self.task_env.get_obs()
-        self._last_observation = observation
-        self.obs.append(self._encode_obs(observation))
-        self.episode_id += 1
-        self.test_num += 1
-        return self._stack_last_n_obs()
+                self.obs.clear()
+                self._success_seen = False
+                self._initial_place_empty_cup_xy_dist = None
+                self._initial_place_empty_cup_z = None
+                self._last_stage_reward = self._current_stage_reward()
+                self._last_progress_value = self._current_progress_value()
+                observation = self.task_env.get_obs()
+                self._last_observation = observation
+                self.obs.append(self._encode_obs(observation))
+                self.episode_id += 1
+                self.test_num += 1
+                return self._stack_last_n_obs()
+            except RuntimeError as exc:
+                last_exc = exc
+                if "cannot create buffer" not in str(exc):
+                    self._close_active_env(clear_cache=True)
+                    raise
+                print(
+                    f"[RoboTwinRLEnv] reset camera buffer allocation failed "
+                    f"(try {reset_try + 1}/3, seed={valid_seed}); clearing cache and recreating task env."
+                )
+                self._recreate_task_env()
+            except Exception:
+                self._close_active_env(clear_cache=True)
+                raise
+        raise RuntimeError("RoboTwin reset failed after camera buffer allocation retries") from last_exc
 
     def _raw_reward_after_action(
         self,
@@ -453,5 +494,4 @@ class RoboTwinRLEnv:
 
     def close(self, clear_cache: bool = False):
         if self.task_env is not None and self._has_active_env:
-            self.task_env.close_env(clear_cache=clear_cache)
-            self._has_active_env = False
+            self._close_active_env(clear_cache=clear_cache)

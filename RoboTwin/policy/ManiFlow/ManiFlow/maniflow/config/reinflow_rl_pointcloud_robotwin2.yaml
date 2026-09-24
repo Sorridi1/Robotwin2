@@ -68,6 +68,19 @@ policy:
     num_points: ${policy.visual_cond_len}
     pointwise: true
 
+  action_plan:
+    enabled: true
+    target_mode: lowpass
+    lowpass_kernel_size: 3
+    preserve_dims: []
+    predictor_hidden_dims: [256, 256]
+    loss_type: l1
+    loss_coef: 1.0
+    detach_visual_input: true
+    detach_for_flow: true
+    injection: additive
+    output_mode: flow
+
 training:
   device: "cuda:0"
   env_device: "cuda:0"
@@ -192,10 +205,11 @@ rl:
     # sigma = clamp(sigma_base(k) * exp(residual_scale * tanh(h(o,t,x))), sigma_min, sigma_max)
     noise_head_type: residual_schedule  # fixed(无xt参与) 或 residual_schedule(xt参与,网络预测偏移量并和base组合)
     noise_backbone: tcn         # mlp / tcn / transformer, only used by residual_schedule
+    noise_conditioning_mode: reference_flow  # default / plan / reference_flow
     base_sigma_schedule: linear         # constant / linear / cosine
     base_sigma: 0.02
-    base_sigma_min: 0.006
-    base_sigma_max: 0.035
+    base_sigma_min: 0.0072   #0.006*1.2
+    base_sigma_max: 0.042    #0.035*1.2
     sigma_min: 0.003
     sigma_max: 0.06
     residual_scale: 0.5
@@ -249,7 +263,7 @@ rl:
     betas: [0.9, 0.95]
     gamma: 0.99
     gae_lambda: 0.95
-    ent_coef: 0.005
+    ent_coef: 0.0      #0.005
     vf_coef: 0.5
     max_grad_norm: 1.0
     target_kl: 0.02

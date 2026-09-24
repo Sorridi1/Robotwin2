@@ -406,7 +406,13 @@ class TrainManiFlowRoboTwinWorkspace:
         lastest_ckpt_path = self.get_checkpoint_path(tag=mode, monitor_key=cfg.checkpoint.topk.monitor_key)
         if lastest_ckpt_path.is_file():
             cprint(f"Resuming from {mode} checkpoint {lastest_ckpt_path}", 'magenta')
-            self.load_checkpoint(path=lastest_ckpt_path) # rewrite self.output_dir
+            # Evaluation only needs policy/EMA weights and metadata. Loading the
+            # training optimizer makes legacy checkpoints incompatible whenever
+            # the current policy has gained parameters (for example action_plan).
+            self.load_checkpoint(
+                path=lastest_ckpt_path,
+                exclude_keys=('optimizer',),
+            ) # rewrite self.output_dir
             # print ckpt info
             cprint(f"{self.epoch} epochs, {self.global_step} steps", 'magenta')
         else:

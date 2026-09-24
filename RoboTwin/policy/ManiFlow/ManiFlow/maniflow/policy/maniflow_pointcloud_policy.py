@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from einops import reduce
@@ -10,6 +10,7 @@ from maniflow.common.pytorch_util import dict_apply
 from maniflow.common.model_util import print_params
 from maniflow.model.vision_3d.pointnet_extractor import DP3Encoder
 from maniflow.model.diffusion.ditx import DiTX
+from maniflow.model.action_plan import FixedCoarseActionOperator, FutureActionPlanPredictor
 from maniflow.model.common.sample_util import *
 
 class ManiFlowTransformerPointcloudPolicy(BasePolicy):
@@ -46,6 +47,7 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
             sample_t_mode_consistency="discrete",
             sample_dt_mode_consistency="uniform", 
             sample_target_t_mode="relative", # relative, absolute
+            action_plan=None,
             **kwargs):
         super().__init__()
 
@@ -91,6 +93,26 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         cprint(f"[ManiFlowTransformerPointcloudPolicy] pointnet_type: {self.pointnet_type}", "yellow")
         
         cprint(f"[ManiFlowTransformerPointcloudPolicy] Using DiTX model", "red")
+        action_plan = action_plan or {}
+        self.action_plan_enabled = bool(action_plan.get("enabled", False))
+        self.plan_target_mode = str(action_plan.get("target_mode", "lowpass"))
+        self.plan_loss_type = str(action_plan.get("loss_type", "l1")).lower()
+        self.plan_loss_coef = float(action_plan.get("loss_coef", 1.0))
+        self.plan_output_mode = str(action_plan.get("output_mode", "flow")).lower()
+        self.plan_detach_visual_input = bool(action_plan.get("detach_visual_input", True))
+        self.plan_detach_for_flow = bool(action_plan.get("detach_for_flow", True))
+        self.plan_injection = str(action_plan.get("injection", "additive")).lower()
+        if self.plan_loss_type not in ("l1", "mse"):
+            raise ValueError(f"Unsupported action_plan.loss_type={self.plan_loss_type}")
+        if self.plan_output_mode not in ("flow", "plan_only"):
+            raise ValueError(f"Unsupported action_plan.output_mode={self.plan_output_mode}")
+        if self.plan_injection != "additive":
+            raise ValueError(f"Unsupported action_plan.injection={self.plan_injection}")
+        if self.action_plan_enabled and not self.plan_detach_visual_input:
+            raise ValueError("action_plan.detach_visual_input must be true for gradient isolation")
+        if self.action_plan_enabled and not self.plan_detach_for_flow:
+            raise ValueError("action_plan.detach_for_flow must be true for gradient isolation")
+
         model = DiTX(
             input_dim=input_dim,
             output_dim=action_dim,
@@ -108,10 +130,26 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
             block_type=block_type,
             pre_norm_modality=pre_norm_modality,
             language_conditioned=language_conditioned,
+            plan_dim=action_dim if self.action_plan_enabled else None,
         )
         
         self.obs_encoder = obs_encoder
         self.model = model
+        if self.action_plan_enabled:
+            self.coarse_action_operator = FixedCoarseActionOperator(
+                mode=self.plan_target_mode,
+                kernel_size=int(action_plan.get("lowpass_kernel_size", 3)),
+                preserve_dims=action_plan.get("preserve_dims", ()),
+            )
+            self.plan_predictor = FutureActionPlanPredictor(
+                visual_dim=obs_feature_dim,
+                horizon=horizon,
+                action_dim=action_dim,
+                hidden_dims=action_plan.get("predictor_hidden_dims", (256, 256)),
+            )
+        else:
+            self.coarse_action_operator = None
+            self.plan_predictor = None
         
         self.normalizer = LinearNormalizer()
         self.horizon = horizon
@@ -148,12 +186,60 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         cprint(f"  - sample_target_t_mode: {self.sample_target_t_mode}", "yellow")
 
         print_params(self)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Strictly load checkpoints while allowing only legacy action-plan omissions."""
+        if not (strict and self.action_plan_enabled):
+            return super().load_state_dict(state_dict, strict=strict)
+        incompatible = super().load_state_dict(state_dict, strict=False)
+        allowed_prefixes = ("plan_predictor.", "model.plan_proj.")
+        invalid_missing = [
+            key for key in incompatible.missing_keys
+            if not key.startswith(allowed_prefixes)
+        ]
+        if invalid_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Checkpoint mismatch beyond newly introduced action-plan parameters: "
+                f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
+            )
+        return incompatible
+
+    def build_coarse_action_target(self, actions: torch.Tensor) -> torch.Tensor:
+        if not self.action_plan_enabled or self.coarse_action_operator is None:
+            raise RuntimeError("Action plan is disabled")
+        expected_shape = (actions.shape[0], self.horizon, self.action_dim)
+        if tuple(actions.shape) != expected_shape:
+            raise ValueError(f"Expected normalized actions {expected_shape}, got {tuple(actions.shape)}")
+        with torch.no_grad():
+            return self.coarse_action_operator(actions).detach()
+
+    def predict_action_plan(
+        self,
+        vis_cond: torch.Tensor,
+        detach_visual: bool = True,
+    ) -> torch.Tensor:
+        if not self.action_plan_enabled or self.plan_predictor is None:
+            raise RuntimeError("Action plan is disabled")
+        plan_input = vis_cond.detach() if detach_visual else vis_cond
+        plan = self.plan_predictor(plan_input)
+        expected_shape = (vis_cond.shape[0], self.horizon, self.action_dim)
+        if tuple(plan.shape) != expected_shape:
+            raise RuntimeError(f"Expected predicted plan {expected_shape}, got {tuple(plan.shape)}")
+        return plan
+
+    def get_plan_condition(self, vis_cond: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self.action_plan_enabled:
+            return None
+        return self.predict_action_plan(
+            vis_cond, detach_visual=self.plan_detach_visual_input
+        ).detach()
         
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, 
             vis_cond=None,
             lang_cond=None,
+            plan_cond=None,
             **kwargs
             ):
         
@@ -168,6 +254,7 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
             N = self.num_inference_steps,
             vis_cond=vis_cond,
             lang_cond=lang_cond,
+            plan_cond=plan_cond,
            **kwargs)
         
         return ode_traj[-1] # sample ode returns the whole traj, return the last one
@@ -175,6 +262,23 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
 
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return self._predict_action_impl(obs_dict, plan_override=None)
+
+    def predict_action_with_plan(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        plan_override: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Held-out diagnostic API; plan_override must already be normalized [B,H,Da]."""
+        if not self.action_plan_enabled:
+            raise RuntimeError("Oracle plan override requires action_plan.enabled=true")
+        return self._predict_action_impl(obs_dict, plan_override=plan_override)
+
+    def _predict_action_impl(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        plan_override: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -208,15 +312,34 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]).to(device))
         nobs_features = self.obs_encoder(this_nobs)
         vis_cond = nobs_features.reshape(B, -1, Do) # B, self.n_obs_steps*L, Do
+        plan_pred = None
+        plan_cond = None
+        if self.action_plan_enabled:
+            plan_pred = self.predict_action_plan(
+                vis_cond, detach_visual=self.plan_detach_visual_input
+            )
+            if plan_override is None:
+                plan_cond = plan_pred.detach()
+            else:
+                expected_shape = (B, T, Da)
+                if tuple(plan_override.shape) != expected_shape:
+                    raise ValueError(
+                        f"Expected normalized plan_override {expected_shape}, got {tuple(plan_override.shape)}"
+                    )
+                plan_cond = plan_override.to(device=device, dtype=dtype).detach()
         # empty data for action
         cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
 
-        # run sampling
-        nsample = self.conditional_sample(
-            cond_data, 
-            vis_cond=vis_cond,
-            lang_cond=lang_cond,
-            **self.kwargs)
+        # Plan-only is a diagnostic regression baseline; otherwise use the flow sampler.
+        if self.action_plan_enabled and self.plan_output_mode == "plan_only" and plan_override is None:
+            nsample = plan_pred
+        else:
+            nsample = self.conditional_sample(
+                cond_data,
+                vis_cond=vis_cond,
+                lang_cond=lang_cond,
+                plan_cond=plan_cond,
+                **self.kwargs)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
@@ -232,6 +355,8 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
             'action': action,
             'action_pred': action_pred,
         }
+        if plan_pred is not None:
+            result['plan_pred'] = plan_pred
         
         return result
 
@@ -249,6 +374,11 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         ) -> torch.optim.Optimizer:
         optim_groups = self.model.get_optim_groups(
             weight_decay=weight_decay)
+        if self.action_plan_enabled:
+            optim_groups.append({
+                "params": list(self.plan_predictor.parameters()),
+                "weight_decay": weight_decay,
+            })
         
         backbone_params = list()
         other_obs_params = list()
@@ -390,6 +520,7 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         # get visual and language conditions
         vis_cond = model_kwargs.get('vis_cond', None)
         lang_cond = model_kwargs.get('lang_cond', None)
+        plan_cond = model_kwargs.get('plan_cond', None)
         ema_model = model_kwargs.get('ema_model', None)
         consistency_batchsize = actions.shape[0]
         device = actions.device
@@ -430,6 +561,7 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
                 target_t=target_t_next.squeeze(), 
                 vis_cond=vis_cond[-consistency_batchsize:],
                 lang_cond=lang_cond[-consistency_batchsize:] if lang_cond is not None else None,
+                plan_cond=plan_cond,
             ) 
         # predict the target data point using the average velocity
         pred_x1_ct = x_t_next + (1 - t_next) * v_avg_to_next_target
@@ -503,6 +635,21 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         this_n_point_cloud = this_nobs['point_cloud'].reshape(batch_size,-1, *this_nobs['point_cloud'].shape[1:])
         this_n_point_cloud = this_n_point_cloud[..., :3]
 
+        plan_pred = None
+        plan_for_flow = None
+        loss_plan = torch.zeros((), device=self.device, dtype=nactions.dtype)
+        plan_target = None
+        if self.action_plan_enabled:
+            plan_target = self.build_coarse_action_target(nactions)
+            plan_pred = self.predict_action_plan(
+                vis_cond, detach_visual=self.plan_detach_visual_input
+            )
+            if self.plan_loss_type == "l1":
+                loss_plan = F.l1_loss(plan_pred, plan_target)
+            else:
+                loss_plan = F.mse_loss(plan_pred, plan_target)
+            plan_for_flow = plan_pred.detach()
+
         """Get flow and consistency targets"""
         flow_batchsize = int(batch_size * self.flow_batch_ratio)
         consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
@@ -511,27 +658,32 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         # Get flow velocity targets
         flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
                                                     vis_cond=vis_cond[:flow_batchsize],
-                                                    lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
+                                                    lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None,
+                                                    plan_cond=plan_for_flow[:flow_batchsize] if plan_for_flow is not None else None)
         v_flow_pred = self.model(
             sample=flow_target_dict['x_t'], 
             timestep=flow_target_dict['t'].squeeze(),
             target_t=flow_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[:flow_batchsize],
-            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
+            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+            plan_cond=plan_for_flow[:flow_batchsize] if plan_for_flow is not None else None)
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         # Get consistency velocity targets
-        consistency_target_dict = self.get_consistency_velocity(nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-                                                                        ema_model=ema_model
-                                                                        )
+        consistency_target_dict = self.get_consistency_velocity(
+            nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
+            vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
+            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+            ema_model=ema_model,
+            plan_cond=plan_for_flow[flow_batchsize:flow_batchsize+consistency_batchsize] if plan_for_flow is not None else None,
+        )
         v_ct_pred = self.model(
             sample=consistency_target_dict['x_t'], 
             timestep=consistency_target_dict['t'].squeeze(),
             target_t=consistency_target_dict['target_t'].squeeze(),
             vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
             lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+            plan_cond=plan_for_flow[flow_batchsize:flow_batchsize+consistency_batchsize] if plan_for_flow is not None else None,
             )
         v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
 
@@ -552,6 +704,9 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
         loss += loss_ct.mean()
         loss_ct = loss_ct.mean().item()  
 
+        if self.action_plan_enabled:
+            loss += self.plan_loss_coef * loss_plan
+
         loss = loss.mean()
         loss_dict = {
                 'loss_flow': loss_flow,
@@ -560,6 +715,14 @@ class ManiFlowTransformerPointcloudPolicy(BasePolicy):
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),
         }
+        if self.action_plan_enabled:
+            loss_dict.update({
+                'loss_plan': loss_plan.item(),
+                'plan_mae': F.l1_loss(plan_pred.detach(), plan_target).item(),
+                'plan_mse': F.mse_loss(plan_pred.detach(), plan_target).item(),
+                'plan_pred_abs_mean': plan_pred.detach().abs().mean().item(),
+                'plan_target_abs_mean': plan_target.abs().mean().item(),
+            })
         
 
         return loss, loss_dict
