@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import copy
+from contextlib import nullcontext
 import os
 import pathlib
 import random
@@ -22,7 +23,6 @@ import hydra
 import numpy as np
 import torch
 import torch.nn as nn
-import tqdm
 import wandb
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
@@ -36,6 +36,9 @@ sys.path.append(os.path.join(MANIFLOW_ROOT, "ManiFlow", "maniflow"))
 sys.path.append(ROBOTWIN_ROOT)
 
 from maniflow.common.ppo_buffer_pointcloud import PPOBufferPointcloud
+from maniflow.common.ppo_optimizer import build_actor_optimizer, load_actor_optimizer_state
+from maniflow.common.robotwin_env_pool import SerialEnvPool, SubprocessEnvPool
+from maniflow.common.rl_progress import RLIterationProgress
 from maniflow.common.pytorch_util import dict_apply
 from maniflow.model.rl.pointcloud_critic import PointcloudCritic
 from maniflow.model.rl.ppo_maniflow_pointcloud import PPOManiFlowPointcloud
@@ -109,13 +112,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.critic.to(device)
         self.ppo_actor.actor_old.to(cfg.rl.actor.actor_old_device)
 
-        actor_params = list(self.ppo_actor.actor_parameters())
-        self.actor_optimizer = torch.optim.AdamW(
-            actor_params,
-            lr=cfg.rl.ppo.actor_lr,
-            weight_decay=cfg.rl.ppo.actor_weight_decay,
-            betas=tuple(cfg.rl.ppo.betas),
-        )
+        self.actor_optimizer = build_actor_optimizer(self.ppo_actor, cfg.rl.ppo)
+        self._log_actor_learning_rates()
         self.critic_optimizer = torch.optim.AdamW(
             self.critic.parameters(),
             lr=cfg.rl.ppo.critic_lr,
@@ -167,6 +165,13 @@ class TrainReinFlowRLRoboTwinWorkspace:
             cprint(f"[RL] Loaded pretrained with missing={missing}, unexpected={unexpected}", "yellow")
         cprint(f"[RL] Loaded pretrained actor from {ckpt_path}", "green")
 
+    def _log_actor_learning_rates(self):
+        rates = {group["name"]: group["lr"] for group in self.actor_optimizer.param_groups}
+        cprint(
+            f"[RL] AdamW learning rates: actor={rates['actor']:.2e}, noise={rates['noise']:.2e}",
+            "cyan",
+        )
+
     def _obs_to_tensor(self, obs: Dict[str, np.ndarray], device=None) -> Dict[str, torch.Tensor]:
         device = device or self.device
         obs_list = list(obs) if isinstance(obs, (list, tuple)) else [obs]
@@ -193,21 +198,34 @@ class TrainReinFlowRLRoboTwinWorkspace:
         base_seed = int(self.cfg.training.seed)
         base_start_seed = 100000 * (1 + base_seed)
         env_seed_stride = int(self.cfg.rl.rollout.get("env_seed_stride", 1000))
-        envs = []
+        env_configs = []
         for env_idx in range(n_envs):
-            envs.append(
-                hydra.utils.instantiate(
-                    self.cfg.rl.env,
-                    seed=base_seed + env_idx,
-                    start_seed=(
-                        int(start_seeds[env_idx])
-                        if start_seeds is not None
-                        else base_start_seed + env_idx * env_seed_stride
-                    ),
-                )
+            env_config = OmegaConf.to_container(self.cfg.rl.env, resolve=True)
+            env_config.update(
+                seed=base_seed + env_idx,
+                start_seed=(int(start_seeds[env_idx]) if start_seeds is not None
+                            else base_start_seed + env_idx * env_seed_stride),
             )
+            env_configs.append(env_config)
+        backend = str(self.cfg.rl.rollout.get("backend", "serial"))
+        if backend == "serial":
+            envs = SerialEnvPool(env_configs)
+        elif backend == "subprocess":
+            observation_shapes = None
+            if bool(self.cfg.rl.rollout.get("shared_memory", True)):
+                observation_shapes = {
+                    key: (int(self.cfg.n_obs_steps), *tuple(self.cfg.shape_meta.obs[key].shape))
+                    for key in ("point_cloud", "agent_pos")
+                }
+            envs = SubprocessEnvPool(
+                env_configs, observation_shapes=observation_shapes,
+                worker_threads=int(self.cfg.rl.rollout.get("worker_threads", 1)),
+                timeout_sec=float(self.cfg.rl.rollout.get("worker_timeout_sec", 1800)),
+            )
+        else:
+            raise ValueError(f"Unsupported rollout backend: {backend}")
         cprint(
-            f"[RL] Created {n_envs} RoboTwin envs with start_seed="
+            f"[RL] Created {n_envs} RoboTwin envs ({backend}) with start_seed="
             f"{start_seeds if start_seeds is not None else base_start_seed}, "
             f"env_seed_stride={env_seed_stride}",
             "cyan",
@@ -297,24 +315,31 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
         return True, "enabled", 0, actor_loss_scale
 
-    def collect_rollout(self, envs, buffer: PPOBufferPointcloud):
-        if not isinstance(envs, (list, tuple)):
-            envs = [envs]
+    def collect_rollout(self, envs, buffer: PPOBufferPointcloud, progress=None):
         n_envs = len(envs)
         if n_envs != buffer.n_envs:
             raise ValueError(f"Expected {buffer.n_envs} envs, got {n_envs}")
 
-        if self.current_obs is None or bool(self.cfg.rl.rollout.reset_each_iteration):
-            self.current_obs = [env.reset() for env in envs]
-
+        initial_reset_sec = 0.0
+        reset_infos = []
         self.ppo_actor.eval()
         self.critic.eval()
         rollout_infos = []
         sampling_noise_stats = []
-        desc = f"RL rollout itr {self.itr} ({n_envs} envs)"
-        iterator = range(buffer.n_steps)
-        with tqdm.tqdm(iterator, desc=desc, leave=False, mininterval=self.cfg.training.tqdm_interval_sec) as pbar:
-            for step in pbar:
+        actor_sec = 0.0
+        env_wall_sec = 0.0
+        progress_context = nullcontext(progress) if progress is not None else RLIterationProgress(
+            self.itr, buffer.n_steps, self.global_step, self.cfg.training.tqdm_interval_sec,
+        )
+        with progress_context as progress:
+            if self.current_obs is None or bool(self.cfg.rl.rollout.reset_each_iteration):
+                started = time.perf_counter()
+                self.current_obs = envs.reset()
+                initial_reset_sec = time.perf_counter() - started
+                reset_infos.extend(envs.last_reset_infos)
+            progress.start_rollout()
+            for step in range(buffer.n_steps):
+                actor_started = time.perf_counter()
                 obs_for_buffer = self._obs_to_buffer(self.current_obs)
                 obs_ts = self._obs_to_tensor(self.current_obs)
                 with torch.no_grad():
@@ -336,6 +361,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
                         f"logprob={tuple(logprob.shape)}, n_envs={n_envs}"
                     )
                 action_np = action.detach().cpu().numpy()
+                actor_sec += time.perf_counter() - actor_started
 
                 next_obs_batch = []
                 rewards = np.zeros(n_envs, dtype=np.float32)
@@ -346,8 +372,10 @@ class TrainReinFlowRLRoboTwinWorkspace:
                 executed_steps = 0
                 step_infos = []
 
-                for env_idx, env in enumerate(envs):
-                    next_obs, reward, terminated, truncated, info = env.step(action_np[env_idx])
+                started = time.perf_counter()
+                results = envs.step(action_np)
+                env_wall_sec += time.perf_counter() - started
+                for env_idx, (next_obs, reward, terminated, truncated, info) in enumerate(results):
                     raw_reward = float(np.sum(info.get("raw_rewards", [reward])))
 
                     rewards[env_idx] = float(reward)
@@ -359,8 +387,6 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     step_infos.append(info)
                     rollout_infos.append(info)
 
-                    if terminated or truncated:
-                        next_obs = env.reset()
                     next_obs_batch.append(next_obs)
 
                 buffer.add(
@@ -376,11 +402,15 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     raw_reward=raw_rewards,
                 )
                 self.global_step += executed_steps
-                pbar.set_postfix(
-                    reward=f"{float(np.mean(rewards)):.2f}",
-                    success=int(np.sum(successes)),
-                    env_step=max((info.get("take_action_cnt", 0) for info in step_infos), default=0),
-                    refresh=False,
+                progress.advance_rollout(
+                    completed=step + 1,
+                    successes=successes,
+                    terminateds=terminateds,
+                    truncateds=truncateds,
+                    executed_steps=executed_steps,
+                    global_step=self.global_step,
+                    env_steps=[int(info.get("take_action_cnt", 0)) for info in step_infos],
+                    reward=float(np.mean(rewards)),
                 )
                 self.current_obs = next_obs_batch
 
@@ -389,6 +419,24 @@ class TrainReinFlowRLRoboTwinWorkspace:
         summary["rollout_chunks"] = len(rollout_infos)
         summary["rollout_last_env_step"] = rollout_infos[-1].get("take_action_cnt", 0) if rollout_infos else 0
         summary["rollout_any_success_info"] = float(any(info.get("success", False) for info in rollout_infos))
+        summary["actor_inference_sec"] = actor_sec
+        summary["env_wall_sec"] = env_wall_sec
+        summary["initial_reset_wall_sec"] = initial_reset_sec
+        for key in ("env_step_sec", "reset_sec", "expert_check_sec", "expert_cache_hits", "expert_cache_misses"):
+            summary[f"worker_{key}_sum"] = float(sum(
+                info.get(f"perf/{key}", 0.0) for info in [*reset_infos, *rollout_infos]
+            ))
+        for info in [*reset_infos, *rollout_infos]:
+            validation = info.get("validation", {})
+            for key in ("validation_attempts", "rejected_count", "validation_time_sec", "setup_demo_count", "play_once_count"):
+                metric = f"scene_validation/{key}"
+                summary[metric] = summary.get(metric, 0.0) + float(validation.get(key, 0.0))
+            for reason, count in validation.get("rejection_reasons", {}).items():
+                metric = f"scene_validation/rejected/{reason}"
+                summary[metric] = summary.get(metric, 0.0) + float(count)
+            mode = validation.get("validation_mode")
+            if mode is not None:
+                summary[f"scene_validation/mode_{mode}"] = 1.0
         if len(sampling_noise_stats) > 0:
             for key in sampling_noise_stats[0]:
                 values = np.asarray([item[key] for item in sampling_noise_stats], dtype=np.float32)
@@ -409,6 +457,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
         buffer: PPOBufferPointcloud,
         update_actor: bool = True,
         actor_loss_scale: float = 1.0,
+        progress=None,
     ):
         buffer.update(self._obs_to_buffer(self.current_obs), self.critic)
         obs, chains, returns, values, advantages, logprobs = buffer.make_dataset()
@@ -429,6 +478,12 @@ class TrainReinFlowRLRoboTwinWorkspace:
         actor_loss_scale = max(0.0, min(1.0, float(actor_loss_scale)))
         actor_grad_params = list(self.ppo_actor.actor_parameters()) if actor_update_enabled else []
         minibatch_starts = list(range(0, total_steps, batch_size))
+        if progress is not None:
+            groups_per_epoch = (len(minibatch_starts) + grad_accum_steps - 1) // grad_accum_steps
+            progress.start_update(
+                minibatches=update_epochs * len(minibatch_starts),
+                optimizer_steps=update_epochs * groups_per_epoch,
+            )
 
         self.ppo_actor.eval()
         self.critic.train()
@@ -524,6 +579,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     item["loss"] = float(loss.detach().cpu())
                     item["actor_loss_scale"] = actor_loss_scale if actor_update_enabled else 0.0
                     metrics.append(item)
+                    if progress is not None:
+                        progress.advance_update(len(metrics), optimizer_steps)
                     if actor_update_enabled and target_kl is not None and item["approx_kl"] > float(target_kl):
                         stopped_by_kl = True
                         break
@@ -547,6 +604,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
                 self.scaler.step(self.critic_optimizer)
                 self.scaler.update()
                 optimizer_steps += 1
+                if progress is not None:
+                    progress.advance_update(len(metrics), optimizer_steps, stopped_by_kl=stopped_by_kl)
                 if stopped_by_kl:
                     break
             if stopped_by_kl:
@@ -617,7 +676,9 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.global_step = int(payload.get("global_step", 0))
         self.ppo_actor.load_state_dict(payload["ppo_actor"], strict=True)
         self.critic.load_state_dict(payload["critic"])
-        self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
+        migrated = load_actor_optimizer_state(self.actor_optimizer, payload["actor_optimizer"])
+        if migrated:
+            cprint("[RL] Split legacy actor optimizer into actor/noise groups; Adam state preserved.", "yellow")
         self.critic_optimizer.load_state_dict(payload["critic_optimizer"])
         if "scaler" in payload:
             self.scaler.load_state_dict(payload["scaler"])
@@ -625,6 +686,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
         self.best_eval_score = float(payload.get("best_eval_score", float("-inf")))
         self.best_eval_itr = int(payload.get("best_eval_itr", -1))
         cprint(f"[RL] Resumed RL checkpoint from {path}", "green")
+        self._log_actor_learning_rates()
 
     def export_actor_checkpoint(self, tag="latest", itr=None):
         path = pathlib.Path(self.output_dir) / "checkpoints" / f"{tag}.ckpt"
@@ -659,9 +721,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
         return eval_cfg.get(key, default)
 
     def _close_envs_for_eval(self, envs):
-        next_start_seeds = [int(getattr(env, "next_seed", 0)) for env in envs]
-        for env in envs:
-            env.close(clear_cache=True)
+        next_start_seeds = envs.get_next_seeds()
+        envs.close(clear_cache=True)
         self.current_obs = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -829,33 +890,43 @@ class TrainReinFlowRLRoboTwinWorkspace:
             )
             wandb.config.update({"output_dir": self.output_dir})
 
-        envs = self._make_envs()
-        buffer = self._make_buffer()
+        envs = None
         try:
+            envs = self._make_envs()
+            buffer = self._make_buffer()
             while self.itr < int(cfg.rl.ppo.num_iterations):
                 t0 = time.time()
                 num_iterations = int(cfg.rl.ppo.num_iterations)
                 buffer.reset()
-                rollout_log = self.collect_rollout(envs, buffer)
-                update_actor, actor_skip_reason, actor_skip_code, actor_loss_scale = self.should_update_actor(rollout_log)
-                step_log = {
-                    "itr": self.itr,
-                    "epoch": self.itr,
-                    "global_step": self.global_step,
-                    "lr/actor": self.actor_optimizer.param_groups[0]["lr"],
-                    "lr/critic": self.critic_optimizer.param_groups[0]["lr"],
-                    "rl/actor_update_enabled": float(update_actor),
-                    "rl/actor_loss_scale": float(actor_loss_scale),
-                    "rl/actor_update_skip_code": float(actor_skip_code),
-                    "rl/consecutive_zero_success_iters": float(self.consecutive_zero_success_iters),
-                }
-                step_log.update({f"rollout/{k}": v for k, v in rollout_log.items()})
-                update_log = self.ppo_update(
-                    buffer,
-                    update_actor=update_actor,
-                    actor_loss_scale=actor_loss_scale,
-                )
+                with RLIterationProgress(
+                    self.itr, buffer.n_steps, self.global_step, cfg.training.tqdm_interval_sec,
+                ) as progress:
+                    rollout_log = self.collect_rollout(envs, buffer, progress=progress)
+                    rollout_sec = time.time() - t0
+                    update_actor, actor_skip_reason, actor_skip_code, actor_loss_scale = self.should_update_actor(rollout_log)
+                    step_log = {
+                        "itr": self.itr,
+                        "epoch": self.itr,
+                        "global_step": self.global_step,
+                        "lr/actor": self.actor_optimizer.param_groups[0]["lr"],
+                        "lr/noise": self.actor_optimizer.param_groups[1]["lr"],
+                        "lr/critic": self.critic_optimizer.param_groups[0]["lr"],
+                        "rl/actor_update_enabled": float(update_actor),
+                        "rl/actor_loss_scale": float(actor_loss_scale),
+                        "rl/actor_update_skip_code": float(actor_skip_code),
+                        "rl/consecutive_zero_success_iters": float(self.consecutive_zero_success_iters),
+                    }
+                    step_log.update({f"rollout/{k}": v for k, v in rollout_log.items()})
+                    update_started = time.perf_counter()
+                    update_log = self.ppo_update(
+                        buffer,
+                        update_actor=update_actor,
+                        actor_loss_scale=actor_loss_scale,
+                        progress=progress,
+                    )
                 step_log.update(update_log)
+                step_log["time/rollout_sec"] = rollout_sec
+                step_log["time/ppo_update_sec"] = time.perf_counter() - update_started
                 step_log["time/itr_sec"] = time.time() - t0
 
                 cprint(
@@ -863,7 +934,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
                     f"succ={step_log.get('rollout/success_rate', 0):.3f} "
                     f"raw_reward={step_log.get('rollout/rollout_raw_reward_sum', 0):.3f} "
                     f"actor_update={int(update_actor)}({actor_skip_reason}, scale={actor_loss_scale:.2f}) "
-                    f"sigma={step_log.get('loss/sigma_mean', 0):.4f} "
+                    f"sigma={step_log.get('rollout/sampling_sigma_mean', 0):.6f} "
+                    f"|delta|={step_log.get('rollout/sampling_delta_abs_mean', 0):.6f} "
                     f"loss={step_log.get('loss/loss', 0):.4f}",
                     "cyan",
                 )
@@ -888,7 +960,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
                 )
                 if should_eval:
                     next_start_seeds = self._close_envs_for_eval(envs)
-                    envs = []
+                    envs = None
                     eval_log = self.run_eval_and_update_best(eval_iteration)
                     step_log.update(eval_log)
                     self.save_resume_checkpoint("latest_rl", itr=self.itr + 1)
@@ -911,8 +983,8 @@ class TrainReinFlowRLRoboTwinWorkspace:
             self.save_resume_checkpoint("latest_rl")
             raise
         finally:
-            for env in envs:
-                env.close(clear_cache=True)
+            if envs is not None:
+                envs.close(clear_cache=True)
             if use_wandb:
                 wandb_run.finish()
 

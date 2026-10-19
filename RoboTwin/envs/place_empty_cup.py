@@ -5,6 +5,12 @@ import sapien
 
 class place_empty_cup(Base_Task):
 
+    # Broad table-relative sanity bounds, not the narrower object spawn ranges.
+    SCENE_VALIDATION_BOUNDS = {
+        "workspace_min": [-0.65, -0.40, -0.10],
+        "workspace_max": [0.65, 0.40, 0.75],
+    }
+
     def setup_demo(self, **kwags):
         super()._init_task_env_(**kwags)
 
@@ -51,6 +57,31 @@ class place_empty_cup(Base_Task):
         self.add_prohibit_area(self.coaster, padding=0.05)
         self.delay(2)
         cup_pose = self.cup.get_pose().p
+
+    def cheap_validate_scene(self, config):
+        """Only reject objects obviously outside the task table/workspace."""
+        options = {**self.SCENE_VALIDATION_BOUNDS, **config}
+        minimum = np.asarray(options["workspace_min"], dtype=float)
+        maximum = np.asarray(options["workspace_max"], dtype=float)
+        if (minimum.shape != (3,) or maximum.shape != (3,)
+                or not np.isfinite([minimum, maximum]).all() or np.any(minimum >= maximum)):
+            raise ValueError("Invalid place_empty_cup scene validation workspace bounds")
+        table_position = np.asarray(self.table.get_pose().p)
+        metrics = {}
+        for name, actor in (("cup", self.cup), ("coaster", self.coaster)):
+            pose = actor.get_pose()
+            if not np.isfinite(pose.p).all() or not np.isfinite(pose.q).all():
+                return False, "nonfinite_actor_pose", {"actor": name}
+            relative_position = np.asarray(pose.p) - table_position
+            metrics[f"{name}_relative_table"] = relative_position.tolist()
+            if np.any(relative_position < minimum) or np.any(relative_position > maximum):
+                return False, "task_specific_invalid", {**metrics, "actor": name, "check": "outside_workspace"}
+        return True, "accepted", metrics
+
+    def get_scene_metadata(self):
+        metadata = super().get_scene_metadata()
+        metadata["info"] = {"{A}": "021_cup/base0", "{B}": "019_coaster/base0"}
+        return metadata
 
     def play_once(self):
         # Get the current pose of the cup

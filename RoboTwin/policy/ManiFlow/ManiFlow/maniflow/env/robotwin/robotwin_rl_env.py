@@ -2,12 +2,18 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
 import gc
+import copy
 import importlib
+import logging
 import os
 import sys
+import time
 
 import numpy as np
 import yaml
+
+from maniflow.common.robotwin_seed_cache import ExpertSeedCache, seed_cache_fingerprint
+from maniflow.env.robotwin.scene_validator import CheapSceneValidator, SceneValidationResult
 
 
 ROBOTWIN_ROOT = Path(__file__).resolve().parents[6]
@@ -16,18 +22,17 @@ if str(ROBOTWIN_ROOT) not in sys.path:
 if str(ROBOTWIN_ROOT / "description" / "utils") not in sys.path:
     sys.path.append(str(ROBOTWIN_ROOT / "description" / "utils"))
 
-_IMPORT_CWD = os.getcwd()
-os.chdir(ROBOTWIN_ROOT)
-try:
-    from envs import CONFIGS_PATH  # noqa: E402
-    from envs.utils.create_actor import UnStableError  # noqa: E402
-finally:
-    os.chdir(_IMPORT_CWD)
+CONFIGS_PATH = ROBOTWIN_ROOT / "task_config"
+logger = logging.getLogger(__name__)
 
-try:
-    from generate_episode_instructions import generate_episode_descriptions  # noqa: E402
-except Exception:
-    generate_episode_descriptions = None
+
+def _is_unstable_setup(exc):
+    from envs.utils.create_actor import UnStableError
+    return isinstance(exc, UnStableError)
+
+
+class ExpertValidationError(RuntimeError):
+    """A transient simulation/planning failure that must not be cached."""
 
 
 def _read_yaml(path: Path):
@@ -73,6 +78,15 @@ class RoboTwinRLEnv:
         reward_contact_cost_weight: float = 0.0,
         reward_time_cost: float = 0.0,
         reward_use_task_progress_fallback: bool = True,
+        head_pointcloud_only: bool = False,
+        render_on_observation_only: bool = False,
+        rendering: Optional[Dict] = None,
+        log_action_steps: bool = True,
+        expert_seed_cache_dir: Optional[str] = None,
+        expert_seed_cache_mode: str = "off",
+        expert_seed_cache_namespace: str = "v1",
+        scene_validation: Optional[Dict] = None,
+        language_conditioned: bool = False,
         **kwargs,
     ):
         if reward_mode not in ("sparse_success", "stage_delta", "ant_style"):
@@ -91,11 +105,29 @@ class RoboTwinRLEnv:
         self.reward_mode = reward_mode
         self.reward_agg_method = reward_agg_method
         self.expert_check = expert_check
+        self.scene_validation = dict(scene_validation or {})
+        self.validation_mode = str(self.scene_validation.get(
+            "mode", "expert" if expert_check else "none",
+        ))
+        if self.validation_mode not in ("none", "cheap", "expert"):
+            raise ValueError(f"Unsupported scene_validation.mode: {self.validation_mode}")
+        self.scene_validator = CheapSceneValidator(self.scene_validation)
+        self.language_conditioned = bool(language_conditioned)
         self.instruction_type = instruction_type
         self.ckpt_setting = ckpt_setting
         self.render_freq = render_freq
         self.clear_cache_freq = clear_cache_freq
-        self.max_seed_tries = max_seed_tries
+        if int(clear_cache_freq) < 1:
+            raise ValueError("clear_cache_freq must be >= 1")
+        self._env_close_count = 0
+        self.head_pointcloud_only = bool(head_pointcloud_only)
+        self.render_on_observation_only = bool(render_on_observation_only)
+        self.rendering = dict(rendering or {})
+        self.log_action_steps = bool(log_action_steps)
+        self.max_seed_tries = int(self.scene_validation.get("max_seed_tries", max_seed_tries))
+        self.camera_allocation_retries = int(self.scene_validation.get("camera_allocation_retries", 3))
+        if self.max_seed_tries < 1 or self.camera_allocation_retries < 1:
+            raise ValueError("Scene validation attempts and camera allocation retries must be positive")
         self.action_type = action_type
         self.reward_progress_scale = float(reward_progress_scale)
         self.reward_success_bonus = float(reward_success_bonus)
@@ -121,6 +153,29 @@ class RoboTwinRLEnv:
         self._last_observation = None
         self._has_active_env = False
         self.base_args = self._build_task_args()
+        sources = list((ROBOTWIN_ROOT / "envs").rglob("*.py"))
+        sources.extend([
+            Path(__file__),
+            Path(__file__).with_name("scene_validator.py"),
+            CONFIGS_PATH / f"{self.task_config}.yml",
+            CONFIGS_PATH / "_camera_config.yml",
+            CONFIGS_PATH / "_embodiment_config.yml",
+            Path(self.base_args["left_robot_file"]) / "config.yml",
+            Path(self.base_args["right_robot_file"]) / "config.yml",
+        ])
+        fingerprint = (
+            seed_cache_fingerprint(
+                {**self.base_args, "scene_validation": {
+                    **self.scene_validator.config, "mode": self.validation_mode,
+                }}, sources, expert_seed_cache_namespace,
+            )
+            if expert_seed_cache_mode != "off" else "disabled"
+        )
+        self.expert_seed_cache = ExpertSeedCache(
+            expert_seed_cache_dir, fingerprint, mode=expert_seed_cache_mode,
+        )
+        self.last_reset_info = {}
+        self._reset_validation_stats()
 
     def _clear_backend_cache(self):
         gc.collect()
@@ -132,12 +187,15 @@ class RoboTwinRLEnv:
         except Exception:
             pass
 
-    def _close_active_env(self, clear_cache: bool = True):
+    def _close_active_env(self, clear_cache: Optional[bool] = None):
+        self._env_close_count += 1
+        if clear_cache is None:
+            clear_cache = self._env_close_count % int(self.clear_cache_freq) == 0
         if self.task_env is not None:
             try:
                 self.task_env.close_env(clear_cache=clear_cache)
             except Exception:
-                pass
+                logger.exception("Failed to close RoboTwin scene")
         self._has_active_env = False
         if clear_cache:
             self._clear_backend_cache()
@@ -157,6 +215,18 @@ class RoboTwinRLEnv:
         args["render_freq"] = self.render_freq
         args["eval_video_log"] = False
         args["eval_video_save_dir"] = None
+        args["render_on_observation_only"] = self.render_on_observation_only
+        args["rendering"] = self.rendering
+        args["log_action_steps"] = self.log_action_steps
+        if self.head_pointcloud_only:
+            if args["data_type"].get("conbine", False):
+                raise ValueError("head_pointcloud_only would change a combined multi-camera pointcloud")
+            args["camera"]["collect_head_camera"] = True
+            args["camera"]["collect_wrist_camera"] = False
+            for key in ("rgb", "depth", "endpose", "mesh_segmentation", "actor_segmentation", "third_view"):
+                args["data_type"][key] = False
+            args["data_type"]["pointcloud"] = True
+            args["data_type"]["qpos"] = True
 
         embodiment_config_path = Path(CONFIGS_PATH) / "_embodiment_config.yml"
         embodiment_types = _read_yaml(embodiment_config_path)
@@ -196,9 +266,6 @@ class RoboTwinRLEnv:
             "agent_pos": np.asarray(observation["joint_action"]["vector"], dtype=np.float32),
             "point_cloud": np.asarray(observation["pointcloud"], dtype=np.float32),
         }
-        head = observation.get("observation", {}).get("head_camera", {})
-        if "rgb" in head:
-            obs["head_cam"] = (np.moveaxis(head["rgb"], -1, 0) / 255.0).astype(np.float32)
         return obs
 
     def _stack_last_n_obs(self):
@@ -215,9 +282,8 @@ class RoboTwinRLEnv:
         return result
 
     def _sample_instruction(self, episode_info):
-        if generate_episode_descriptions is None:
-            return None
         try:
+            from generate_episode_instructions import generate_episode_descriptions
             episode_info_list = [episode_info["info"]]
             descriptions = generate_episode_descriptions(self.task_name, episode_info_list, 1)
             candidates = descriptions[0][self.instruction_type]
@@ -225,33 +291,115 @@ class RoboTwinRLEnv:
         except Exception:
             return None
 
-    def _find_valid_seed(self, start_seed: int):
-        seed = start_seed
-        last_episode_info = {"info": {}}
-        for _ in range(self.max_seed_tries):
-            if not self.expert_check:
-                return seed, last_episode_info
-            args = dict(self.base_args)
+    def _reset_validation_stats(self):
+        self.last_validation_info = {
+            "validation_mode": self.validation_mode, "validation_attempts": 0,
+            "rejected_count": 0, "accepted_seed": None, "validation_time_sec": 0.0,
+            "setup_demo_count": 0, "play_once_count": 0, "setup_time_sec": 0.0,
+            "cache_hits": 0, "cache_misses": 0, "rejection_reasons": {},
+            "setup_exception_types": {}, "last_metrics": {},
+        }
+
+    def _publish_validation_stats(self):
+        self.last_reset_info["validation"] = copy.deepcopy(self.last_validation_info)
+
+    def _cache_stat(self, hit):
+        name = "cache_hits" if hit else "cache_misses"
+        self.last_validation_info[name] += 1
+        # Keep the existing performance metric names for older dashboards.
+        key = "perf/expert_cache_hits" if hit else "perf/expert_cache_misses"
+        self.last_reset_info[key] = self.last_reset_info.get(key, 0) + 1
+
+    def _reject_candidate(self, seed, result):
+        self.last_validation_info["rejected_count"] += 1
+        reasons = self.last_validation_info["rejection_reasons"]
+        reasons[result.reason] = reasons.get(result.reason, 0) + 1
+        self.last_validation_info["last_rejected_seed"] = int(seed)
+        self.last_validation_info["last_metrics"] = result.metrics
+
+    def _setup_candidate(self, seed):
+        for retry in range(self.camera_allocation_retries):
+            started = time.perf_counter()
+            self.last_validation_info["setup_demo_count"] += 1
             try:
                 self.task_env.setup_demo(
-                    now_ep_num=self.episode_id,
-                    seed=seed,
-                    is_test=True,
-                    **args,
+                    now_ep_num=self.episode_id, seed=int(seed), is_test=True,
+                    **copy.deepcopy(self.base_args),
                 )
-                episode_info = self.task_env.play_once()
-                valid = bool(self.task_env.plan_success and self.task_env.check_success())
-                self.task_env.close_env(clear_cache=True)
-                if valid:
-                    return seed, episode_info
-            except UnStableError:
-                self.task_env.close_env(clear_cache=True)
-            except Exception:
-                self.task_env.close_env(clear_cache=True)
-            seed += 1
-        raise RuntimeError(
-            f"Failed to find a valid RoboTwin seed for {self.task_name} after {self.max_seed_tries} tries"
+                self._has_active_env = True
+                return
+            except Exception as exc:
+                types = self.last_validation_info["setup_exception_types"]
+                name = type(exc).__name__
+                types[name] = types.get(name, 0) + 1
+                if (isinstance(exc, RuntimeError) and "cannot create buffer" in str(exc)
+                        and retry + 1 < self.camera_allocation_retries):
+                    logger.warning("Camera allocation failed at seed %s (%s); recreating scene", seed, name)
+                    self._recreate_task_env()
+                    continue
+                raise
+            finally:
+                self.last_validation_info["setup_time_sec"] += time.perf_counter() - started
+
+    def _scene_metadata(self):
+        hook = getattr(self.task_env, "get_scene_metadata", None)
+        return copy.deepcopy(hook() if callable(hook) else getattr(self.task_env, "info", {"info": {}}))
+
+    @staticmethod
+    def _validation_metadata(result, episode_info):
+        info = copy.deepcopy(episode_info)
+        info["scene_validation"] = {"reason": result.reason, "metrics": result.metrics}
+        return info
+
+    def _run_cheap_validation(self):
+        started = time.perf_counter()
+        try:
+            return self.scene_validator.validate(self.task_env)
+        finally:
+            self.last_validation_info["validation_time_sec"] += time.perf_counter() - started
+
+    def _validate_seed_in_temporary_scene(self, seed):
+        """Offline validation and legacy expert path; online cheap reset does not use this."""
+        started = time.perf_counter()
+        try:
+            self._setup_candidate(seed)
+            if self.validation_mode == "expert":
+                self.last_validation_info["play_once_count"] += 1
+                validation_started = time.perf_counter()
+                try:
+                    episode_info = self.task_env.play_once()
+                    valid = bool(self.task_env.plan_success and self.task_env.check_success())
+                except Exception as exc:
+                    raise ExpertValidationError(
+                        f"Expert rollout failed for seed {seed}: {type(exc).__name__}: {exc}"
+                    ) from exc
+                finally:
+                    self.last_validation_info["validation_time_sec"] += time.perf_counter() - validation_started
+                result = SceneValidationResult(valid, "accepted" if valid else "expert_failure")
+            else:
+                episode_info = self._scene_metadata()
+                result = (self._run_cheap_validation() if self.validation_mode == "cheap"
+                          else SceneValidationResult(True))
+            return result.valid, self._validation_metadata(result, episode_info)
+        except Exception as exc:
+            if _is_unstable_setup(exc):
+                result = SceneValidationResult(False, "unstable_setup", {"exception_type": type(exc).__name__})
+                return False, self._validation_metadata(result, {"info": {}})
+            raise
+        finally:
+            self._close_active_env()
+            if self.validation_mode == "expert":
+                self.last_reset_info["perf/expert_check_sec"] = (
+                    self.last_reset_info.get("perf/expert_check_sec", 0.0) + time.perf_counter() - started
+                )
+
+    def validate_seed(self, seed):
+        """Prevalidate without keeping a scene; cache keys include mode and thresholds."""
+        valid, info, hit = self.expert_seed_cache.get_or_validate(
+            seed, lambda: self._validate_seed_in_temporary_scene(seed),
         )
+        self._cache_stat(hit)
+        return valid, info
 
     def _current_stage_reward(self) -> float:
         fn = getattr(self.task_env, "stage_reward", None)
@@ -326,56 +474,118 @@ class RoboTwinRLEnv:
         except Exception:
             return 0.0
 
+    def _finish_reset(self, episode_info):
+        if self.language_conditioned or self.validation_mode == "expert":
+            instruction = self._sample_instruction(episode_info)
+            if instruction is not None:
+                self.task_env.set_instruction(instruction=instruction)
+        self.obs.clear()
+        self._success_seen = False
+        self._initial_place_empty_cup_xy_dist = None
+        self._initial_place_empty_cup_z = None
+        self._last_stage_reward = self._current_stage_reward()
+        self._last_progress_value = self._current_progress_value()
+        observation = self.task_env.get_obs()
+        self._last_observation = observation
+        self.obs.append(self._encode_obs(observation))
+        self.episode_id += 1
+        self.test_num += 1
+        return self._stack_last_n_obs()
+
     def reset(self, seed: Optional[int] = None):
+        self.last_reset_info = {}
+        self._reset_validation_stats()
         if seed is not None:
             self.next_seed = int(seed)
         if self._has_active_env:
-            self._close_active_env(clear_cache=True)
+            self._close_active_env()
 
-        last_exc = None
-        for reset_try in range(3):
-            valid_seed, episode_info = self._find_valid_seed(self.next_seed)
-            self.next_seed = valid_seed + 1
-
-            args = dict(self.base_args)
-            try:
-                self.task_env.setup_demo(
-                    now_ep_num=self.episode_id,
-                    seed=valid_seed,
-                    is_test=True,
-                    **args,
-                )
-                self._has_active_env = True
-                instruction = self._sample_instruction(episode_info)
-                if instruction is not None:
-                    self.task_env.set_instruction(instruction=instruction)
-
-                self.obs.clear()
-                self._success_seen = False
-                self._initial_place_empty_cup_xy_dist = None
-                self._initial_place_empty_cup_z = None
-                self._last_stage_reward = self._current_stage_reward()
-                self._last_progress_value = self._current_progress_value()
-                observation = self.task_env.get_obs()
-                self._last_observation = observation
-                self.obs.append(self._encode_obs(observation))
-                self.episode_id += 1
-                self.test_num += 1
-                return self._stack_last_n_obs()
-            except RuntimeError as exc:
-                last_exc = exc
-                if "cannot create buffer" not in str(exc):
+        observation_failures = 0
+        try:
+            for _ in range(self.max_seed_tries):
+                candidate = self.next_seed
+                self.next_seed = candidate + 1
+                self.last_validation_info["validation_attempts"] += 1
+                try:
+                    if self.validation_mode == "expert":
+                        valid, metadata = self.validate_seed(candidate)
+                        if not valid:
+                            cached = metadata.get("scene_validation", {})
+                            self._reject_candidate(candidate, SceneValidationResult(
+                                False, cached.get("reason", "expert_failure"), cached.get("metrics", {}),
+                            ))
+                            continue
+                        # Expert execution changed the scene, so this mode must rebuild.
+                        self._setup_candidate(candidate)
+                    else:
+                        cached = None
+                        if self.validation_mode == "cheap":
+                            cached = self.expert_seed_cache.lookup(candidate)
+                            self._cache_stat(cached is not None)
+                            if cached is not None and not cached[0]:
+                                record = cached[1].get("scene_validation", {})
+                                self._reject_candidate(candidate, SceneValidationResult(
+                                    False, record.get("reason", "cached_invalid_scene"), record.get("metrics", {}),
+                                ))
+                                continue
+                        self._setup_candidate(candidate)
+                        metadata = self._scene_metadata()
+                        if self.validation_mode == "cheap":
+                            # Even a cached positive seed is checked on its fresh physical state.
+                            result = self._run_cheap_validation()
+                            self.last_validation_info["last_metrics"] = result.metrics
+                            metadata = self._validation_metadata(result, metadata)
+                            self.expert_seed_cache.store(candidate, result.valid, metadata)
+                            if not result.valid:
+                                self._reject_candidate(candidate, result)
+                                self._close_active_env()
+                                continue
+                    obs = self._finish_reset(metadata)
+                    self.last_validation_info["accepted_seed"] = candidate
+                    if (self.last_validation_info["rejected_count"]
+                            and self.scene_validation.get("log_rejection_reason", True)):
+                        logger.info(
+                            "Scene validation mode=%s accepted seed=%s after %s rejections: %s",
+                            self.validation_mode, candidate,
+                            self.last_validation_info["rejected_count"],
+                            self.last_validation_info["rejection_reasons"],
+                        )
+                    return obs
+                except ExpertValidationError as exc:
+                    self._reject_candidate(candidate, SceneValidationResult(
+                        False, "expert_exception", {"exception_type": type(exc.__cause__).__name__},
+                    ))
+                    logger.warning("%s; transient failure not cached", exc)
+                except Exception as exc:
+                    if _is_unstable_setup(exc):
+                        result = SceneValidationResult(
+                            False, "unstable_setup", {"exception_type": type(exc).__name__},
+                        )
+                        if self.validation_mode == "cheap":
+                            self.expert_seed_cache.store(
+                                candidate, False, self._validation_metadata(result, {"info": {}}),
+                            )
+                        self._reject_candidate(candidate, result)
+                        self._close_active_env()
+                        continue
+                    if isinstance(exc, RuntimeError) and "cannot create buffer" in str(exc):
+                        observation_failures += 1
+                        if observation_failures < self.camera_allocation_retries:
+                            # A resource error is not evidence that this seed is invalid.
+                            logger.warning("Camera allocation failed for seed %s; retrying same seed", candidate)
+                            self._recreate_task_env()
+                            self.next_seed = candidate
+                            continue
+                    logger.exception("Scene initialization failed: seed=%s type=%s", candidate, type(exc).__name__)
                     self._close_active_env(clear_cache=True)
                     raise
-                print(
-                    f"[RoboTwinRLEnv] reset camera buffer allocation failed "
-                    f"(try {reset_try + 1}/3, seed={valid_seed}); clearing cache and recreating task env."
-                )
-                self._recreate_task_env()
-            except Exception:
-                self._close_active_env(clear_cache=True)
-                raise
-        raise RuntimeError("RoboTwin reset failed after camera buffer allocation retries") from last_exc
+            raise RuntimeError(
+                f"No acceptable {self.validation_mode} scene for {self.task_name} after "
+                f"{self.max_seed_tries} candidates; rejections="
+                f"{self.last_validation_info['rejection_reasons']}"
+            )
+        finally:
+            self._publish_validation_stats()
 
     def _raw_reward_after_action(
         self,

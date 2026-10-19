@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
-# bash scripts/train_rl_policy.sh ${alg_name} ${task_name} ${setting} ${expert_data_num} ${addition_info} ${seed} ${gpu_id} ${pretrained_ckpt} [task_config]
+# bash scripts/train_rl_policy.sh ${alg_name} ${task_name} ${setting} ${expert_data_num} ${addition_info} ${seed} ${gpu_id} ${pretrained_ckpt} [task_config] [Hydra overrides...]
 #
 # Runtime switches:
 #   TRAIN=false EVAL=true bash scripts/train_rl_policy.sh ...
@@ -19,6 +19,7 @@ seed=${6}
 gpu_id=${7}
 pretrained_ckpt=${8}
 task_config=${9:-demo_clean_ur5}
+extra_overrides=("${@:10}")
 
 is_blank() {
     [ -z "${1//[[:space:]]/}" ]
@@ -121,7 +122,8 @@ if [ "${train}" = true ]; then
         rl.eval.task_config=${eval_task_config} \
         rl.eval.ckpt_setting=${eval_ckpt_setting} \
         rl.eval.seed=${eval_seed} \
-        rl.eval.addition_info=${addition_info}
+        rl.eval.addition_info=${addition_info} \
+        "${extra_overrides[@]}"
 else
     echo -e "\033[33m=== RL training disabled ===\033[0m"
 fi

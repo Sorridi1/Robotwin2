@@ -70,7 +70,7 @@ policy:
 
   action_plan:
     enabled: true
-    target_mode: lowpass       # lowpass / identity (raw-action predictor baseline)
+    target_mode: identity       # lowpass / identity (raw-action predictor baseline)
     lowpass_kernel_size: 3
     preserve_dims: []          # e.g. binary gripper dimensions
     predictor_hidden_dims: [256, 256]
