@@ -1,0 +1,43 @@
+# RAFE: expert interpolation guides only the exploration variance.
+defaults:
+  - reinflow_rl_pointcloud_robotwin2
+  - _self_
+
+name: train_rafe_expert_interpolation
+logging:
+  project: RAFE-RL
+
+rl:
+  strict_load_pretrained: true
+  noise_guidance:
+    enabled: true
+    mode: expert_interpolation
+    # Required: existing ManiFlow Zarr with data/{point_cloud,state,action}
+    # and meta/episode_ends. No statistics are fitted from this data.
+    dataset_path: null
+    batch_size: 16
+    update_interval: 1
+    gradient_steps: 4  # Four noise optimizer steps after each complete PPO update.
+    learning_rate: 3.0e-6
+    initial_warmup_steps: 0
+    sample_all_steps: true
+    log_diagnostics: true
+    max_grad_norm: 1.0
+    weight_decay: 0.0
+    num_workers: 0
+  actor:
+    noise_head_type: residual_schedule
+    noise_backbone: tcn
+    noise_conditioning_mode: default
+    noise_output_mode: full
+    freeze_obs_encoder: true
+  eval:
+    config_name: reinflow_rl_pointcloud_robotwin2_expert_interp
+    alg_name: reinflow_rl_pointcloud_robotwin2_expert_interp
+    policy_name: RAFE
+
+hydra:
+  run:
+    dir: ${oc.env:RAFE_OUTPUT_ROOT,outputs}/${exp_name}_seed${training.seed}
+  sweep:
+    dir: ${oc.env:RAFE_OUTPUT_ROOT,outputs}/${exp_name}_seed${training.seed}

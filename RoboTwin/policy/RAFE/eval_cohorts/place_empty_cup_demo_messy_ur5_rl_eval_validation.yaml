@@ -1,0 +1,23 @@
+rl:
+  env:
+    scene_validation:
+      check_finite_state: true
+      check_joint_limits: true
+      joint_limit_tolerance: 0.05
+      reject_initial_success: true
+      check_initial_penetration: true
+      max_initial_penetration: 0.03
+      enable_task_specific_check: true
+      task_specific:
+        workspace_min:
+        - -0.65
+        - -0.4
+        - -0.1
+        workspace_max:
+        - 0.65
+        - 0.4
+        - 0.75
+      mode: cheap
+      max_seed_tries: 100
+      camera_allocation_retries: 3
+      log_rejection_reason: true

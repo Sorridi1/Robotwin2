@@ -67,3 +67,12 @@ tests/
 
 # RoboTwin generated outputs (output/ is already covered above)
 /RoboTwin/outputs/
+
+# Keep the RAFE method's reproducible checks and inherited evaluation cohorts.
+!RoboTwin/policy/RAFE/tests/
+!RoboTwin/policy/RAFE/tests/**
+!RoboTwin/policy/RAFE/ManiFlow/tests/
+!RoboTwin/policy/RAFE/ManiFlow/tests/**
+!RoboTwin/policy/RAFE/eval_cohorts/
+!RoboTwin/policy/RAFE/eval_cohorts/**
+/RoboTwin/policy/RAFE/outputs/

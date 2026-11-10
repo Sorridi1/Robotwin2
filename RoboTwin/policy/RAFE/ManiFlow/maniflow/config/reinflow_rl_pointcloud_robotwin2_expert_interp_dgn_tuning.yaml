@@ -1,0 +1,15 @@
+# An initial RAFE tuning experiment informed by DGN, not a DGN reproduction.
+# DGN's official noise LR is 3e-4; start lower for Flow-transition likelihoods.
+# DGN trains 2/10 complete expert epochs; four minibatches here are a smaller trial.
+defaults:
+  - reinflow_rl_pointcloud_robotwin2_expert_interp
+  - _self_
+
+name: train_rafe_expert_interpolation_dgn_tuning
+rl:
+  noise_guidance:
+    learning_rate: 1.0e-4
+    gradient_steps: 4
+  eval:
+    config_name: reinflow_rl_pointcloud_robotwin2_expert_interp_dgn_tuning
+    alg_name: reinflow_rl_pointcloud_robotwin2_expert_interp_dgn_tuning

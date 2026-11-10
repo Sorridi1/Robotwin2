@@ -1,0 +1,328 @@
+defaults:
+  - task: demo_task
+
+name: train_reinflow_rl_pointcloud_robotwin2
+
+task_name: null
+task_config: demo_messy_ur5
+instruction_type: unseen
+shape_meta: ${task.shape_meta}
+exp_name: "debug-rl"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 16
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+keypoint_visible_rate: 1.0
+obs_as_global_cond: True
+
+policy:
+  _target_: maniflow.policy.maniflow_pointcloud_policy.ManiFlowTransformerPointcloudPolicy
+  block_type: "DiTX"
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  visual_cond_len: 512
+  max_lang_cond_len: 1024
+  qkv_bias: true
+  qk_norm: true
+
+  language_conditioned: false
+  pre_norm_modality: false
+
+  flow_batch_ratio: 0.75
+  consistency_batch_ratio: 0.25
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete"
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
+  use_point_crop: true
+  crop_shape:
+    - 80
+    - 80
+  encoder_type: "DP3Encoder"
+  encoder_output_dim: 128
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  use_pc_color: true
+  pointnet_type: "pointnet"
+  downsample_points: true
+  pointcloud_encoder_cfg:
+    in_channels: 3
+    out_channels: ${policy.encoder_output_dim}
+    use_layernorm: true
+    final_norm: layernorm
+    normal_channel: false
+    num_points: ${policy.visual_cond_len}
+    pointwise: true
+
+training:
+  device: "cuda:0"
+  env_device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  use_ema: true
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${exp_name}
+  project: ManiFlow-RL
+  resume: false
+  tags:
+    - ${logging.project}
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+checkpoint:
+  save_ckpt: true
+  topk:
+    monitor_key: rollout_success_rate
+    mode: max
+    k: 1
+    format_str: 'epoch={epoch:04d}-rollout_success_rate={rollout_success_rate:.4f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+rl:
+  pretrained_checkpoint_path: null
+  pretrained_state_key: ema_model
+  strict_load_pretrained: true
+  resume: true
+  resume_path: null
+  checkpoint_every: 1
+  export_actor_checkpoint: true
+  eval:
+    enabled: true
+    interval: 20
+    run_final: true
+    best_ckpt_tag: best
+    candidate_ckpt_tag: eval_candidate
+    config_name: reinflow_rl_pointcloud_robotwin2
+    alg_name: reinflow_rl_pointcloud_robotwin2
+    policy_name: ManiFlow
+    task_config: ${task_config}
+    ckpt_setting: ${task_config}
+    seed: 0
+    addition_info: null
+    scene_selection: rl  # expert / rl / expert_fail / baseline_fail
+    num_episodes: 100
+    max_seed_tries: 10000
+    scene_seed_file: /media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json
+    scene_validation_config: null  # optional explicit rules; normally read frozen rules from the common bank
+    scene_manifest: null           # optional legacy explicit replay; normally leave null
+    scene_cache_mode: readwrite    # off / readwrite / readonly
+    baseline_checkpoint: /media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-maniflow_pointcloud_policy_robotwin2-0428_seed0/checkpoints/epoch=0500-val_loss=0.373935.ckpt
+
+  env:
+    _target_: maniflow.env.robotwin.robotwin_rl_env.RoboTwinRLEnv
+    task_name: ${task_name}
+    task_config: ${task_config}
+    n_obs_steps: ${n_obs_steps}
+    n_action_steps: ${n_action_steps}
+    seed: ${training.seed}
+    reward_mode: ${rl.reward_mode}
+    reward_agg_method: sum
+    expert_check: false  # Legacy fallback only; scene_validation.mode takes precedence.
+    language_conditioned: ${policy.language_conditioned}
+    scene_validation:
+      mode: cheap  # none / cheap / expert
+      max_seed_tries: 100
+      camera_allocation_retries: 3
+      check_finite_state: true
+      check_joint_limits: true
+      joint_limit_tolerance: 0.05  # radians (or meters for prismatic joints)
+      reject_initial_success: true
+      check_initial_penetration: true
+      max_initial_penetration: 0.03  # meters; normal supporting contacts are allowed
+      enable_task_specific_check: true
+      log_rejection_reason: true
+      task_specific:
+        workspace_min: [-0.65, -0.40, -0.10]  # place_empty_cup: relative to table pose
+        workspace_max: [0.65, 0.40, 0.75]
+    instruction_type: ${instruction_type}
+    ckpt_setting: ${setting}
+    render_freq: 0
+    clear_cache_freq: 5  # Normal scene closes; allocation failures still force cleanup.
+    head_pointcloud_only: true
+    render_on_observation_only: true
+    log_action_steps: false
+    rendering:
+      shader: rt
+      samples_per_pixel: 32
+      path_depth: 8
+      denoiser: oidn
+    expert_seed_cache_dir: /media/Elements1/ljj/ManiFlow/cache/expert_seeds
+    expert_seed_cache_mode: readwrite  # off / readwrite / readonly
+    expert_seed_cache_namespace: v1  # Bump after changing assets not covered by source/config hashes.
+    max_seed_tries: 100
+    action_type: qpos
+    reward_progress_scale: ${rl.reward.progress_scale}
+    reward_success_bonus: ${rl.reward.success_bonus}
+    reward_healthy: ${rl.reward.healthy}
+    reward_ctrl_cost_weight: ${rl.reward.ctrl_cost_weight}
+    reward_ctrl_cost_mode: ${rl.reward.ctrl_cost_mode}
+    reward_ctrl_cost_normalize: ${rl.reward.ctrl_cost_normalize}
+    reward_contact_cost_weight: ${rl.reward.contact_cost_weight}
+    reward_time_cost: ${rl.reward.time_cost}
+    reward_use_task_progress_fallback: ${rl.reward.use_task_progress_fallback}
+
+  reward_mode: ant_style
+  # reward_mode can also be set to sparse_success or stage_delta.
+  reward:
+    # Ant-style decomposition: progress + success + healthy - ctrl - contact - time.
+    # Progress uses task.stage_reward() when available; place_empty_cup has a distance fallback.
+    progress_scale: 1.0
+    success_bonus: 1.5
+    healthy: 0.0
+    ctrl_cost_weight: 0.001
+    ctrl_cost_mode: delta
+    ctrl_cost_normalize: true
+    contact_cost_weight: 0.0
+    time_cost: 0.0
+    use_task_progress_fallback: true
+
+  actor:
+    inference_steps: ${policy.num_inference_steps}
+    ft_denoising_steps: ${policy.num_inference_steps}
+    min_sampling_denoising_std: 0.003
+    min_logprob_denoising_std: 0.01  # std lower bound for fixed / reinflow_xt
+    max_logprob_denoising_std: 0.04
+    randn_clip_value: 2.0
+    denoised_clip_value: 1.5
+    final_action_clip_value: 1.0
+    clip_ploss_coef: 0.005      #0.02~0.005
+    clip_vloss_coef: null
+    logprob_min: -5.0
+    logprob_max: 5.0
+    normalize_denoising_horizon: true
+    normalize_act_space_dimension: true
+    account_for_initial_stochasticity: False
+    noise_hidden_dims: [128, 128]
+    noise_activation: tanh              # fixed / reinflow_xt bounded-variance MLP activation
+    residual_noise_activation: mish     # residual_schedule noise head default/recommended activation
+    noise_time_dim: 16
+    # fixed keeps the previous time-conditioned noise head behavior.
+    # reinflow_xt adds flattened X_t to that MLP, keeping its bounded log-variance mapping.
+    # To use it: noise_head_type=reinflow_xt AND noise_conditioning_mode=default.
+    # residual_schedule enables action-conditioned residual schedule adaptive exploration:
+    # log_sigma = clamp(log(sigma_base(k)) + residual_scale * h(o,t,x), log bounds)
+    noise_parameterization: log_residual
+    noise_head_type: residual_schedule  # fixed(o,t) / reinflow_xt(o,t,X_t) / residual_schedule
+    noise_backbone: tcn         # mlp / tcn / transformer, only used by residual_schedule
+    # RAFE conditions exploration only on observation, time and current action state.
+    noise_conditioning_mode: default
+    base_sigma_schedule: linear         # constant / linear / cosine
+    base_sigma: 0.02
+    base_sigma_min: 0.0072   #0.006*1.2
+    base_sigma_max: 0.042    #0.035*1.2
+    sigma_min: 0.003
+    sigma_max: 0.06
+    residual_scale: 1.0  # Linear gain only; 0 fixes sigma to the base schedule.
+    action_conditioned_noise: true      # residual_schedule only; reinflow_xt always uses X_t
+    noise_output_mode: full             # full / chunk_shared / dim_shared
+    noise_model_dim: 128
+    noise_action_embed_dim: 64
+    zero_init_noise_output: true
+    use_horizon_pos_emb: true
+    tcn_kernel_size: 3
+    tcn_num_layers: 2
+    transformer_num_layers: 1
+    transformer_num_heads: 4
+    transformer_ffn_dim: 256
+    transformer_dropout: 0.0            # keep 0 for deterministic get_actions/get_logprobs distribution
+    actor_old_device: cuda:0
+    freeze_obs_encoder: true
+
+  critic:
+    _target_: maniflow.model.rl.pointcloud_critic.PointcloudCritic
+    shape_meta: ${shape_meta}
+    n_obs_steps: ${n_obs_steps}
+    encoder_output_dim: 128
+    use_pc_color: ${policy.use_pc_color}
+    pointnet_type: ${policy.pointnet_type}
+    downsample_points: ${policy.downsample_points}
+    pointcloud_encoder_cfg: ${policy.pointcloud_encoder_cfg}
+    hidden_dims: [256, 256]
+    activation: relu
+    pool: mean
+
+  rollout:
+    backend: subprocess  # serial / subprocess; same synchronous PPO collection boundary.
+    shared_memory: true
+    worker_threads: 1
+    worker_timeout_sec: 1800
+    n_envs: 4
+    n_steps: 64
+    env_seed_stride: 1000
+    reset_each_iteration: true
+    buffer_device: cpu
+
+  ppo:
+    num_iterations: 100
+    batch_size: 4
+    grad_accum_steps: 4
+    update_epochs: 2
+    critic_warmup_iterations: 4
+    actor_lr: 3.0e-6
+    noise_lr: 3.0e-6  # Separate AdamW group; null uses actor_lr for legacy behavior.
+    critic_lr: 5.0e-4
+    actor_weight_decay: 0.0
+    critic_weight_decay: 1.0e-5
+    betas: [0.9, 0.95]
+    gamma: 0.99
+    gae_lambda: 0.95
+    ent_coef: 0.0      #0.005
+    vf_coef: 0.5
+    max_grad_norm: 1.0
+    target_kl: 0.02
+    reward_scale_running: true
+    reward_scale_const: 1.0
+    bootstrap_on_truncated: false
+    use_amp: true
+    skip_actor_update_on_low_success: false
+    skip_actor_update_on_zero_reward: false
+    min_success_rate_for_actor_update: 0.75
+    min_raw_reward_for_actor_update: 0.0
+    downweight_actor_update_on_low_success: true
+    low_success_actor_loss_scale: 0.4
+    downweight_actor_update_on_zero_reward: false
+    zero_reward_actor_loss_scale: 0.25
+
+  bc_anchor:
+    enabled: true
+    coeff: 0.1
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: /media/Elements1/ljj/ManiFlow/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: /media/Elements1/ljj/ManiFlow/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
+
+checkpoint_num: 500
+expert_data_num: 50
+raw_task_name: none
+setting: none

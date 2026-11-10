@@ -1,0 +1,14 @@
+# Same TCN allocation; zero residual scale makes sigma the fixed linear schedule.
+defaults:
+  - reinflow_rl_pointcloud_robotwin2_ppo_sigma
+  - _self_
+
+name: train_rafe_fixed_linear_sigma
+rl:
+  actor:
+    residual_scale: 0.0
+  ppo:
+    noise_lr: 0.0
+  eval:
+    config_name: reinflow_rl_pointcloud_robotwin2_fixed_sigma
+    alg_name: reinflow_rl_pointcloud_robotwin2_fixed_sigma

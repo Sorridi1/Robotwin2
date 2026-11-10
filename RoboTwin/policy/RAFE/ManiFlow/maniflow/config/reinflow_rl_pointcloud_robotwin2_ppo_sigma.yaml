@@ -1,0 +1,13 @@
+# No-reference control: the same TCN and sigma schedule, optimized by PPO.
+defaults:
+  - reinflow_rl_pointcloud_robotwin2_expert_interp
+  - _self_
+
+name: train_rafe_ppo_sigma
+rl:
+  noise_guidance:
+    enabled: false
+    mode: none
+  eval:
+    config_name: reinflow_rl_pointcloud_robotwin2_ppo_sigma
+    alg_name: reinflow_rl_pointcloud_robotwin2_ppo_sigma
