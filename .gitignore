@@ -56,3 +56,14 @@ output/
 aloha_maniskill_sim/
 /scripts/random_test/
 checkpoints/
+
+# Local analysis, environments, documentation, evaluation cohorts, and tests
+analysis/
+envs/
+docs/
+eval_cohorts/
+test/
+tests/
+
+# RoboTwin generated outputs (output/ is already covered above)
+/RoboTwin/outputs/

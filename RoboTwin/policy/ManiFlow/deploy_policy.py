@@ -28,6 +28,7 @@ parent_directory = os.path.dirname(current_file_path)
 sys.path.append(os.path.join(parent_directory, 'ManiFlow'))
 
 from maniflow_policy import *
+from maniflow.common.eval_checkpoint import load_evaluation_config
 
 
 def encode_obs(observation):  # Post-Process Observation
@@ -56,13 +57,16 @@ def get_model(usr_args):
     exp_name = f"{task_name}-{alg_name}-{addition_info}"
     run_dir = os.path.join("/media/Elements1/ljj/ManiFlow/outputs", exp_name + f"_seed{seed}")
 
-    # Evaluate with the configuration that created the checkpoint. Reusing the
-    # repository's current YAML can silently change architecture, inference
-    # steps, and even the RNG stream when new modules are added later.
+    # The archived YAML is only a fallback for resolving a legacy "best" tag.
+    # It can have been edited after training; checkpoint.cfg defines the actual
+    # architecture and inference settings paired with the selected weights.
     archived_config_path = os.path.join(run_dir, ".hydra", "config.yaml")
     if os.path.isfile(archived_config_path):
         cfg = OmegaConf.load(archived_config_path)
-        print(f"Using archived training config: {archived_config_path}")
+    cfg, checkpoint_path = load_evaluation_config(
+        run_dir, usr_args.get("ckpt_tag", "latest"), cfg,
+    )
+    print(f"Using configuration saved in checkpoint: {checkpoint_path}")
 
     hydra_runtime_cfg = {
         "job": {
@@ -86,7 +90,9 @@ def get_model(usr_args):
     cfg.training.seed = int(seed)
     OmegaConf.set_struct(cfg, True)
 
-    ManiFlow_Model = ManiFlow(cfg, usr_args, run_dir=run_dir)
+    model_args = dict(usr_args)
+    model_args["ckpt_tag"] = checkpoint_path.stem
+    ManiFlow_Model = ManiFlow(cfg, model_args, run_dir=run_dir)
     return ManiFlow_Model
 
 

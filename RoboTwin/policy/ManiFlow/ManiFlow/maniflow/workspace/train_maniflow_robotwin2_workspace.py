@@ -125,6 +125,12 @@ class TrainManiFlowRoboTwinWorkspace:
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                # Epoch-end checkpoints precede the counter increments below.
+                self.epoch += 1
+                self.global_step += 1
+                if self.epoch >= cfg.training.num_epochs:
+                    print(f"Training already completed {self.epoch} epochs.")
+                    return
 
         # configure dataset
         dataset: BaseDataset
@@ -168,6 +174,9 @@ class TrainManiFlowRoboTwinWorkspace:
             ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
+            # Preserve EMA warmup instead of overwriting the loaded EMA on the
+            # first resumed update (decay=0 when optimization_step starts at 0).
+            ema.optimization_step = self.global_step
             
         # configure env runner
         # env_runner: BaseRunner
@@ -214,7 +223,7 @@ class TrainManiFlowRoboTwinWorkspace:
         
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        for local_epoch_idx in range(cfg.training.num_epochs):
+        for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()

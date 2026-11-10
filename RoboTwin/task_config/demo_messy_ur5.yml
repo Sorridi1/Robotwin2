@@ -15,7 +15,7 @@ embodiment:
   - 0.7
 
 domain_randomization:
-  cluttered_table: true
+  cluttered_table: false
   random_background: false
   clean_background_rate: 0.0
   random_head_camera_dis: 0.0

@@ -1,5 +1,7 @@
 # 在线 RL 场景验证
 
+评估也可复用相同检查，或选择专家失败但检查合法的困难子集，见 [评估场景筛选](eval_scene_selection.md)。原评估默认仍保持专家成功筛选。
+
 默认 reset 流程现在是 `seed -> setup_demo -> cheap validation -> 保留当前场景 -> get_obs -> rollout`。
 合法场景只初始化一次，不执行 scripted expert；检查失败时关闭该候选场景，递增 seed 再试。
 目标是排除明显非法状态，不证明任务可解，也不筛选容易成功的场景。

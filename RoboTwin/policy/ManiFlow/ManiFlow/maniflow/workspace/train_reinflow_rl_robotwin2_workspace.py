@@ -43,6 +43,9 @@ from maniflow.common.pytorch_util import dict_apply
 from maniflow.model.rl.pointcloud_critic import PointcloudCritic
 from maniflow.model.rl.ppo_maniflow_pointcloud import PPOManiFlowPointcloud
 from maniflow.policy.maniflow_pointcloud_policy import ManiFlowTransformerPointcloudPolicy
+from script.eval_scene_selection import check_selection_mode, evaluation_result_dir
+from script.eval_seed_bank import DEFAULT_SHARED_SEED_FILE
+from script.eval_baseline import DEFAULT_BASELINE_CHECKPOINT
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
@@ -672,6 +675,16 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
     def load_resume_checkpoint(self, path):
         payload = torch.load(open(path, "rb"), pickle_module=dill, map_location="cpu")
+        saved_eval = payload.get("cfg", {}).get("rl", {}).get("eval", {}) or {}
+        saved_selection = saved_eval.get("scene_selection", "expert")
+        current_selection = self._eval_cfg_value("scene_selection", "expert")
+        if (saved_selection != current_selection
+                and np.isfinite(float(payload.get("best_eval_score", float("-inf"))))):
+            raise ValueError(
+                f"Cannot compare saved best score on {saved_selection!r} scenes with "
+                f"{current_selection!r} scenes. Use standalone evaluation for the new cohort, "
+                "or start a new training experiment instead of changing cohorts on resume."
+            )
         self.itr = int(payload["itr"])
         self.global_step = int(payload.get("global_step", 0))
         self.ppo_actor.load_state_dict(payload["ppo_actor"], strict=True)
@@ -761,6 +774,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
         candidate_tag = str(self._eval_cfg_value("candidate_ckpt_tag", "eval_candidate"))
         best_tag = str(self._eval_cfg_value("best_ckpt_tag", "best"))
         addition_info = self._derive_addition_info(config_name)
+        scene_selection = check_selection_mode(self._eval_cfg_value("scene_selection", "expert"))
 
         candidate_path = pathlib.Path(
             self.export_actor_checkpoint(candidate_tag, itr=eval_iteration)
@@ -768,8 +782,12 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
         log_dir = pathlib.Path(self.output_dir) / "eval_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        eval_log_path = log_dir / f"{candidate_tag}_itr_{eval_iteration:04d}.log"
-        result_path = pathlib.Path(self.output_dir) / "eval_results" / f"epoch_{eval_iteration}" / "_result.txt"
+        cohort_suffix = "" if scene_selection == "expert" else f"_{scene_selection}"
+        eval_log_path = log_dir / f"{candidate_tag}{cohort_suffix}_itr_{eval_iteration:04d}.log"
+        result_dir = evaluation_result_dir(
+            pathlib.Path(self.output_dir) / "eval_results" / f"epoch_{eval_iteration}", scene_selection,
+        )
+        result_path = result_dir / "_result.txt"
         if result_path.exists():
             result_path.unlink()
 
@@ -823,13 +841,30 @@ class TrainReinFlowRLRoboTwinWorkspace:
             alg_name,
             "--ckpt_tag",
             candidate_tag,
+            "--eval_scene_selection",
+            scene_selection,
+            "--eval_num_episodes",
+            str(self._eval_cfg_value("num_episodes", 100)),
+            "--eval_max_seed_tries",
+            str(self._eval_cfg_value("max_seed_tries", 10000)),
+            "--eval_scene_cache_mode",
+            str(self._eval_cfg_value("scene_cache_mode", "readwrite")),
+            "--eval_scene_seed_file",
+            str(self._eval_cfg_value("scene_seed_file", DEFAULT_SHARED_SEED_FILE)),
+            "--eval_baseline_checkpoint",
+            str(self._eval_cfg_value("baseline_checkpoint", DEFAULT_BASELINE_CHECKPOINT)),
         ]
+        for cfg_key, cli_key in (("scene_validation_config", "eval_scene_validation_config"),
+                                 ("scene_manifest", "eval_scene_manifest")):
+            value = self._eval_cfg_value(cfg_key)
+            if value not in (None, "", "null", "None"):
+                actor_cmd.extend([f"--{cli_key}", str(value)])
 
         try:
             run_eval_subprocess(
                 actor_cmd,
                 eval_log_path,
-                f"actor eval without noise_head, ckpt_tag={candidate_tag}",
+                f"actor eval without noise_head, ckpt_tag={candidate_tag}, scenes={scene_selection}",
             )
             if not result_path.is_file():
                 raise FileNotFoundError(f"Periodic actor eval did not write expected result file: {result_path}")

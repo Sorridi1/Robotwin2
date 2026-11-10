@@ -1,0 +1,7 @@
+{
+  "xyz_m": [0.0, 0.0, 0.0],
+  "rpy_deg": [0.0, 0.0, 0.0],
+  "verified": false,
+  "source": "TEMPLATE ONLY: replace with the measured correction from source link_6 to the source gripper assembly frame",
+  "caveat": "This is NOT the controller TCP transform. Zero values reproduce the original assembly; do not mark verified before measurement."
+}

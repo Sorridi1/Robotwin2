@@ -107,6 +107,56 @@ class TimeConditionedNoiseHead(nn.Module):
         return torch.exp(0.5 * logvar)
 
 
+class ActionTimeConditionedNoiseHead(TimeConditionedNoiseHead):
+    """ReinFlow-style bounded-variance MLP additionally conditioned on X_t.
+
+    Keep the legacy head's time embedding, activation and log-variance mapping.
+    Only append the current normalized action chunk to the observation features;
+    no plan, reference residual, temporal backbone or base schedule is used.
+    """
+
+    def __init__(
+        self,
+        cond_dim: int,
+        action_horizon: int,
+        action_dim: int,
+        time_dim: int = 16,
+        hidden_dims=(128, 128),
+        min_std: float = 0.01,
+        max_std: float = 0.05,
+        activation: str = "tanh",
+    ):
+        super().__init__(
+            cond_dim=cond_dim + action_horizon * action_dim,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            time_dim=time_dim,
+            hidden_dims=hidden_dims,
+            min_std=min_std,
+            max_std=max_std,
+            activation=activation,
+        )
+        self.input_cond_dim = int(cond_dim)
+
+    def forward(
+        self,
+        cond_emb: torch.Tensor,
+        time: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if cond_emb.ndim != 2 or cond_emb.shape[1] != self.input_cond_dim:
+            raise ValueError(
+                f"Expected cond_emb shape [B,{self.input_cond_dim}], got {tuple(cond_emb.shape)}"
+            )
+        expected_shape = (cond_emb.shape[0], self.action_horizon, self.action_dim)
+        if tuple(x.shape) != expected_shape:
+            raise ValueError(f"Expected x shape {expected_shape}, got {tuple(x.shape)}")
+        action_feature = x.reshape(cond_emb.shape[0], -1).to(
+            device=cond_emb.device, dtype=cond_emb.dtype,
+        )
+        return super().forward(torch.cat([cond_emb, action_feature], dim=-1), time)
+
+
 def _make_activation(name: str) -> nn.Module:
     name = str(name).lower()
     if name == "mish":
@@ -255,7 +305,9 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         self.residual_scale = float(residual_scale)
         self.use_horizon_pos_emb = bool(use_horizon_pos_emb)
         self.noise_conditioning_mode = str(noise_conditioning_mode)
-        if self.noise_conditioning_mode not in ("default", "plan", "reference_flow"):
+        if self.noise_conditioning_mode not in (
+            "default", "plan", "reference_flow", "reference_residual_only"
+        ):
             raise ValueError(
                 f"Unsupported noise_conditioning_mode={self.noise_conditioning_mode}"
             )
@@ -282,7 +334,7 @@ class ActionConditionedResidualNoiseHead(nn.Module):
         self.reference_residual_proj = None
         if self.noise_conditioning_mode in ("plan", "reference_flow"):
             self.plan_proj = nn.Linear(action_dim, self.model_dim)
-        if self.noise_conditioning_mode == "reference_flow":
+        if self.noise_conditioning_mode in ("reference_flow", "reference_residual_only"):
             self.reference_residual_proj = nn.Linear(action_dim, self.model_dim)
 
         if self.use_horizon_pos_emb:
@@ -516,7 +568,7 @@ class PPOManiFlowPointcloud(nn.Module):
         self.last_logprob_noise_stats = {}
         self.last_action_noise_stats = {}
 
-        if self.noise_head_type not in ("fixed", "residual_schedule"):
+        if self.noise_head_type not in ("fixed", "reinflow_xt", "residual_schedule"):
             raise ValueError(f"Unsupported noise_head_type={self.noise_head_type}")
         if self.base_sigma_schedule not in ("constant", "linear", "cosine"):
             raise ValueError(f"Unsupported base_sigma_schedule={self.base_sigma_schedule}")
@@ -524,7 +576,9 @@ class PPOManiFlowPointcloud(nn.Module):
             raise ValueError(
                 f"Invalid sigma clamp bounds: sigma_min={self.sigma_min}, sigma_max={self.sigma_max}"
             )
-        if self.noise_conditioning_mode not in ("default", "plan", "reference_flow"):
+        if self.noise_conditioning_mode not in (
+            "default", "plan", "reference_flow", "reference_residual_only"
+        ):
             raise ValueError(
                 f"Unsupported noise_conditioning_mode={self.noise_conditioning_mode}"
             )
@@ -538,8 +592,13 @@ class PPOManiFlowPointcloud(nn.Module):
                 "noise_head_type=residual_schedule"
             )
 
-        if self.noise_head_type == "fixed":
-            self.noise_head = TimeConditionedNoiseHead(
+        if self.noise_head_type in ("fixed", "reinflow_xt"):
+            noise_head_class = (
+                ActionTimeConditionedNoiseHead
+                if self.noise_head_type == "reinflow_xt"
+                else TimeConditionedNoiseHead
+            )
+            self.noise_head = noise_head_class(
                 cond_dim=base_actor.obs_feature_dim,
                 action_horizon=self.horizon,
                 action_dim=self.action_dim,
@@ -831,8 +890,12 @@ class PPOManiFlowPointcloud(nn.Module):
             std = base_sigma.clamp(min=self.min_sampling_denoising_std)
             clamp_ratio_min = torch.zeros((), device=x.device, dtype=x.dtype)
             clamp_ratio_max = torch.zeros((), device=x.device, dtype=x.dtype)
-        elif self.noise_head_type == "fixed":
-            std = self.noise_head(cond_emb, time).reshape(cond_emb.shape[0], self.horizon, self.action_dim)
+        elif self.noise_head_type in ("fixed", "reinflow_xt"):
+            if self.noise_head_type == "reinflow_xt":
+                std = self.noise_head(cond_emb, time, x)
+            else:
+                std = self.noise_head(cond_emb, time)
+            std = std.reshape(cond_emb.shape[0], self.horizon, self.action_dim)
             base_sigma = std
             delta = torch.zeros_like(std)
             clamp_ratio_min = torch.zeros((), device=x.device, dtype=x.dtype)
@@ -949,14 +1012,16 @@ class PPOManiFlowPointcloud(nn.Module):
             noise_conditioning_mode = getattr(
                 self, "noise_conditioning_mode", "default"
             )
-            if noise_conditioning_mode == "reference_flow":
+            if noise_conditioning_mode in ("reference_flow", "reference_residual_only"):
                 reference_residual = compute_reference_residual(
                     xt, x0, plan_cond, t
                 )
             noise_kwargs = {}
+            # DiT-X above always keeps plan_cond; only the noise head omits it
+            # in reference_residual_only mode.
             if noise_conditioning_mode in ("plan", "reference_flow"):
                 noise_kwargs["plan_cond"] = plan_cond
-            if noise_conditioning_mode == "reference_flow":
+            if noise_conditioning_mode in ("reference_flow", "reference_residual_only"):
                 noise_kwargs["reference_residual"] = reference_residual
             std, step_noise_stats = self._noise_std(
                 cond_emb, t, xt, step,
@@ -1038,14 +1103,14 @@ class PPOManiFlowPointcloud(nn.Module):
             noise_conditioning_mode = getattr(
                 self, "noise_conditioning_mode", "default"
             )
-            if noise_conditioning_mode == "reference_flow":
+            if noise_conditioning_mode in ("reference_flow", "reference_residual_only"):
                 reference_residual = compute_reference_residual(
                     xt, x0, plan_cond, t
                 )
             noise_kwargs = {}
             if noise_conditioning_mode in ("plan", "reference_flow"):
                 noise_kwargs["plan_cond"] = plan_cond
-            if noise_conditioning_mode == "reference_flow":
+            if noise_conditioning_mode in ("reference_flow", "reference_residual_only"):
                 noise_kwargs["reference_residual"] = reference_residual
             std, step_noise_stats = self._noise_std(
                 cond_emb, t, xt, step, learn_exploration_noise,

@@ -70,7 +70,7 @@ policy:
 
   action_plan:
     enabled: true
-    target_mode: lowpass
+    target_mode: identity
     lowpass_kernel_size: 3
     preserve_dims: []
     predictor_hidden_dims: [256, 256]
@@ -138,6 +138,14 @@ rl:
     ckpt_setting: ${task_config}
     seed: 0
     addition_info: null
+    scene_selection: rl  # expert / rl / expert_fail / baseline_fail
+    num_episodes: 100
+    max_seed_tries: 10000
+    scene_seed_file: /media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json
+    scene_validation_config: null  # optional explicit rules; normally read frozen rules from the common bank
+    scene_manifest: null           # optional legacy explicit replay; normally leave null
+    scene_cache_mode: readwrite    # off / readwrite / readonly
+    baseline_checkpoint: /media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-maniflow_pointcloud_policy_robotwin2-0428_seed0/checkpoints/epoch=0500-val_loss=0.373935.ckpt
 
   env:
     _target_: maniflow.env.robotwin.robotwin_rl_env.RoboTwinRLEnv
@@ -211,7 +219,7 @@ rl:
     inference_steps: ${policy.num_inference_steps}
     ft_denoising_steps: ${policy.num_inference_steps}
     min_sampling_denoising_std: 0.003
-    min_logprob_denoising_std: 0.01
+    min_logprob_denoising_std: 0.01  # std lower bound for fixed / reinflow_xt
     max_logprob_denoising_std: 0.04
     randn_clip_value: 2.0
     denoised_clip_value: 1.5
@@ -224,15 +232,18 @@ rl:
     normalize_act_space_dimension: true
     account_for_initial_stochasticity: False
     noise_hidden_dims: [128, 128]
-    noise_activation: tanh              # fixed noise head keeps the previous activation
+    noise_activation: tanh              # fixed / reinflow_xt bounded-variance MLP activation
     residual_noise_activation: mish     # residual_schedule noise head default/recommended activation
     noise_time_dim: 16
     # fixed keeps the previous time-conditioned noise head behavior.
+    # reinflow_xt adds flattened X_t to that MLP, keeping its bounded log-variance mapping.
+    # To use it: noise_head_type=reinflow_xt AND noise_conditioning_mode=default.
     # residual_schedule enables action-conditioned residual schedule adaptive exploration:
     # sigma = clamp(sigma_base(k) * exp(residual_scale * tanh(h(o,t,x))), sigma_min, sigma_max)
-    noise_head_type: residual_schedule  # fixed(无xt参与) 或 residual_schedule(xt参与,网络预测偏移量并和base组合)
+    noise_head_type: residual_schedule  # fixed(o,t) / reinflow_xt(o,t,X_t) / residual_schedule
     noise_backbone: tcn         # mlp / tcn / transformer, only used by residual_schedule
-    noise_conditioning_mode: default  # default / plan / reference_flow
+    # residual_schedule modes: default / plan / reference_flow / reference_residual_only
+    noise_conditioning_mode: reference_residual_only  # fixed / reinflow_xt require default; other modes are residual_schedule-only
     base_sigma_schedule: linear         # constant / linear / cosine
     base_sigma: 0.02
     base_sigma_min: 0.0072   #0.006*1.2
@@ -240,7 +251,7 @@ rl:
     sigma_min: 0.003
     sigma_max: 0.06
     residual_scale: 0.5
-    action_conditioned_noise: true
+    action_conditioned_noise: true      # residual_schedule only; reinflow_xt always uses X_t
     noise_output_mode: full             # full / chunk_shared / dim_shared
     noise_model_dim: 128
     noise_action_embed_dim: 64

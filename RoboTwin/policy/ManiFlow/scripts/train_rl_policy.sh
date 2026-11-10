@@ -57,6 +57,35 @@ eval_task_config=${EVAL_TASK_CONFIG:-${task_config}}
 eval_ckpt_setting=${EVAL_CKPT_SETTING:-${task_config}}
 eval_seed=${EVAL_SEED:-0}
 eval_ckpt_tag=${EVAL_CKPT_TAG:-best}
+eval_scene_selection=${EVAL_SCENE_SELECTION:-expert}
+eval_num_episodes=${EVAL_NUM_EPISODES:-100}
+eval_max_seed_tries=${EVAL_MAX_SEED_TRIES:-10000}
+scene_eval_args=(
+    --eval_scene_selection "${eval_scene_selection}"
+    --eval_num_episodes "${eval_num_episodes}"
+    --eval_max_seed_tries "${eval_max_seed_tries}"
+    --eval_scene_cache_mode "${EVAL_SCENE_CACHE_MODE:-readwrite}"
+    --eval_scene_seed_file "${EVAL_SCENE_SEED_FILE:-/media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json}"
+)
+scene_eval_overrides=(
+    "rl.eval.scene_selection=${eval_scene_selection}"
+    "rl.eval.num_episodes=${eval_num_episodes}"
+    "rl.eval.max_seed_tries=${eval_max_seed_tries}"
+    "rl.eval.scene_cache_mode=${EVAL_SCENE_CACHE_MODE:-readwrite}"
+    "rl.eval.scene_seed_file=${EVAL_SCENE_SEED_FILE:-/media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json}"
+)
+if [ -n "${EVAL_SCENE_VALIDATION_CONFIG:-}" ]; then
+    scene_eval_args+=(--eval_scene_validation_config "${EVAL_SCENE_VALIDATION_CONFIG}")
+    scene_eval_overrides+=("rl.eval.scene_validation_config=${EVAL_SCENE_VALIDATION_CONFIG}")
+fi
+if [ -n "${EVAL_SCENE_MANIFEST:-}" ]; then
+    scene_eval_args+=(--eval_scene_manifest "${EVAL_SCENE_MANIFEST}")
+    scene_eval_overrides+=("rl.eval.scene_manifest=${EVAL_SCENE_MANIFEST}")
+fi
+if [ -n "${EVAL_BASELINE_CHECKPOINT:-}" ]; then
+    scene_eval_args+=(--eval_baseline_checkpoint "${EVAL_BASELINE_CHECKPOINT}")
+    scene_eval_overrides+=("rl.eval.baseline_checkpoint=\"${EVAL_BASELINE_CHECKPOINT}\"")
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFLOW_POLICY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -123,6 +152,7 @@ if [ "${train}" = true ]; then
         rl.eval.ckpt_setting=${eval_ckpt_setting} \
         rl.eval.seed=${eval_seed} \
         rl.eval.addition_info=${addition_info} \
+        "${scene_eval_overrides[@]}" \
         "${extra_overrides[@]}"
 else
     echo -e "\033[33m=== RL training disabled ===\033[0m"
@@ -151,4 +181,5 @@ ${PYTHON_BIN} script/eval_policy.py --config policy/${policy_name}/deploy_policy
     --policy_name ${eval_policy_name} \
     --addition_info ${addition_info} \
     --alg_name ${alg_name} \
-    --ckpt_tag ${eval_ckpt_tag}
+    --ckpt_tag ${eval_ckpt_tag} \
+    "${scene_eval_args[@]}"
