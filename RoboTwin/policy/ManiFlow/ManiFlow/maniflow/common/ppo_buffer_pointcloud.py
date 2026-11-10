@@ -220,7 +220,11 @@ class PPOBufferPointcloud:
             self.success_rate = 0.0
             self.std_success_rate = 0.0
             self.avg_episode_length = 0.0
-            return {}
+            # Record an explicit denominator. No completed episode means that
+            # the success-rate measurement is missing, not an observed zero.
+            # Keep rate/reward keys absent so existing PPO gating fallbacks are
+            # unchanged; this only makes the logging denominator observable.
+            return {"num_episode_finished": 0}
 
         ep_rewards = []
         ep_raw_rewards = []

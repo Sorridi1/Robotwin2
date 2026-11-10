@@ -1,0 +1,88 @@
+{
+  "checkpoint": "/media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-fpopp-0428_recommended_seed0/checkpoints/best.ckpt",
+  "iteration": 20,
+  "observation_indices": [
+    10,
+    60
+  ],
+  "note": "gradient diagnostic uses fixed artificial [+1,-1] advantages, not actual RL returns",
+  "0.0": {
+    "stats": [
+      {
+        "actor_loss": 0.0,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 1.0244548320770264e-08,
+        "old_cfm_mean": 0.0031237592920660973,
+        "current_cfm_mean": 0.0031237597577273846
+      },
+      {
+        "actor_loss": 0.0,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 3.259629011154175e-08,
+        "old_cfm_mean": 0.008303000591695309,
+        "current_cfm_mean": 0.008303001523017883
+      },
+      {
+        "actor_loss": -2.9802322387695312e-08,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 8.195638656616211e-08,
+        "old_cfm_mean": 0.006275214720517397,
+        "current_cfm_mean": 0.006275216583162546
+      },
+      {
+        "actor_loss": 5.960464477539063e-08,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 5.8673322200775146e-08,
+        "old_cfm_mean": 0.005742746405303478,
+        "current_cfm_mean": 0.00574274268001318
+      }
+    ],
+    "grad_norm": 13.015146255493164
+  },
+  "0.1": {
+    "stats": [
+      {
+        "actor_loss": 0.0,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 2.3283064365386963e-08,
+        "old_cfm_mean": 0.003135188017040491,
+        "current_cfm_mean": 0.0031351884827017784
+      },
+      {
+        "actor_loss": 0.0,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 2.8870999813079834e-08,
+        "old_cfm_mean": 0.008236340247094631,
+        "current_cfm_mean": 0.008236339315772057
+      },
+      {
+        "actor_loss": 0.0,
+        "ratio_mean": 1.0,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 3.5390257835388184e-08,
+        "old_cfm_mean": 0.0062876734882593155,
+        "current_cfm_mean": 0.00628767441958189
+      },
+      {
+        "actor_loss": -8.940696716308594e-08,
+        "ratio_mean": 0.9999998807907104,
+        "clip_fraction": 0.0,
+        "raw_logratio_abs": 1.2852251529693604e-07,
+        "old_cfm_mean": 0.005756026599556208,
+        "current_cfm_mean": 0.005756034515798092
+      }
+    ],
+    "grad_norm": 12.995360374450684
+  },
+  "dt_gradient_comparison": {
+    "cosine": 0.9999639391899109,
+    "relative_l2_difference": 0.00863514095544815
+  },
+  "all_gradients_finite": true
+}

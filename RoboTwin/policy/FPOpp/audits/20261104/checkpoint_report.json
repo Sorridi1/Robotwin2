@@ -1,0 +1,62 @@
+{
+  "checkpoint": "/media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-fpopp-0428_recommended_seed0/checkpoints/best.ckpt",
+  "initial_checkpoint": {
+    "path": "/media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-maniflow_pointcloud_policy_robotwin2-0428_seed0/checkpoints/epoch=0500-val_loss=0.373935.ckpt",
+    "state_key": "ema_model",
+    "size_bytes": 2897484957,
+    "mtime_ns": 1777408687591936203
+  },
+  "iteration": 20,
+  "observation_source": "synthetic normalizer statistics",
+  "device": "cuda:0",
+  "frozen_state": {
+    "normalizer.": {
+      "tensors": 18,
+      "changed": []
+    },
+    "obs_encoder.": {
+      "tensors": 22,
+      "changed": []
+    },
+    "plan_predictor.": {
+      "tensors": 0,
+      "changed": []
+    }
+  },
+  "flow_tensors_changed": 261,
+  "native_sampler_max_abs_error": 1.1920928955078125e-07,
+  "action_shape": [
+    2,
+    15,
+    14
+  ],
+  "action_window": [
+    1,
+    16
+  ],
+  "clipping_on_synthetic_obs": {
+    "final_clip_fraction": 0.0,
+    "normalized_action_rms_difference_from_native": 0.0016309816855937243,
+    "normalized_action_max_difference_from_native": 0.010295376181602478
+  },
+  "unchanged_policy_ratios": {
+    "float32": {
+      "actor_loss": -2.9802322387695312e-08,
+      "ratio_mean": 1.0,
+      "clip_fraction": 0.0,
+      "raw_logratio_abs": 5.587935447692871e-08,
+      "old_cfm_mean": 0.019580934196710587,
+      "current_cfm_mean": 0.019580936059355736,
+      "cfm_max_abs_difference": 7.450580596923828e-08
+    },
+    "bfloat16": {
+      "actor_loss": 0.0002638101577758789,
+      "ratio_mean": 1.0005006790161133,
+      "clip_fraction": 0.0,
+      "raw_logratio_abs": 0.0008269734680652618,
+      "old_cfm_mean": 0.01971067488193512,
+      "current_cfm_mean": 0.019678521901369095,
+      "cfm_max_abs_difference": 0.0006286315619945526
+    }
+  }
+}

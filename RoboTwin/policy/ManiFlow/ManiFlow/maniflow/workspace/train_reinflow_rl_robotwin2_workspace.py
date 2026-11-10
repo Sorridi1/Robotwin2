@@ -966,7 +966,7 @@ class TrainReinFlowRLRoboTwinWorkspace:
 
                 cprint(
                     f"[RL] itr={self.itr} step={self.global_step} "
-                    f"succ={step_log.get('rollout/success_rate', 0):.3f} "
+                    f"succ={step_log.get('rollout/success_rate', float('nan')):.3f} "
                     f"raw_reward={step_log.get('rollout/rollout_raw_reward_sum', 0):.3f} "
                     f"actor_update={int(update_actor)}({actor_skip_reason}, scale={actor_loss_scale:.2f}) "
                     f"sigma={step_log.get('rollout/sampling_sigma_mean', 0):.6f} "
