@@ -1,0 +1,109 @@
+# Proposed RoboTwin2/0428 starting configuration, not a measured optimum.
+# FPO++ actor settings follow the official manipulation recipe; shared environment/GAE/critic settings follow our runs.
+# Rationale and exact source comparisons: ../PARAMETERS_0428.md
+checkpoint: /media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-maniflow_pointcloud_policy_robotwin2-0428_seed0/checkpoints/epoch=0500-val_loss=0.373935.ckpt
+resume: null
+state_key: ema_model
+task_name: place_empty_cup
+task_config: demo_messy_ur5
+device: cuda:0
+seed: 0
+output_dir: null
+max_iterations: 100
+total_action_steps: 400000
+checkpoint_every: 1
+actor:
+  inference_steps: null
+  final_action_clip: 1.0
+  intermediate_clip: 1.5
+  huber_delta: 0.5
+fpo:
+  mc_samples: 8
+  mc_batch_size: 2
+  clip_coef: 0.02
+  old_loss_cap: 4.0
+  logratio_cap: 5.0
+  average_chunk: false
+rollout:
+  backend: subprocess
+  n_envs: 4
+  n_steps: 64
+  env_seed_stride: 1000
+  start_seed: null
+  shared_memory: true
+  worker_threads: 1
+  worker_timeout_sec: 1800
+ppo:
+  batch_size: 4
+  grad_accum_steps: 8
+  update_epochs: 4
+  critic_warmup_iterations: 4
+  actor_lr: 1.0e-05
+  actor_eps: 1.0e-8  # Existing run value; set 1.0e-5 only for a new comparison run.
+  critic_lr: 0.0005
+  gamma: 0.99
+  gae_lambda: 0.95
+  reward_scale_running: true
+  reward_scale_const: 1.0
+  vf_coef: 0.5
+  max_grad_norm: 1.0
+  use_amp: true
+  amp_dtype: bfloat16
+env:
+  _target_: maniflow.env.robotwin.robotwin_rl_env.RoboTwinRLEnv
+  reward_mode: ant_style
+  reward_agg_method: sum
+  expert_check: false
+  language_conditioned: false
+  instruction_type: unseen
+  scene_validation:
+    mode: cheap
+    max_seed_tries: 100
+    camera_allocation_retries: 3
+    check_finite_state: true
+    check_joint_limits: true
+    joint_limit_tolerance: 0.05
+    reject_initial_success: true
+    check_initial_penetration: true
+    max_initial_penetration: 0.03
+    enable_task_specific_check: true
+    log_rejection_reason: true
+    task_specific:
+      workspace_min:
+      - -0.65
+      - -0.4
+      - -0.1
+      workspace_max:
+      - 0.65
+      - 0.4
+      - 0.75
+  render_freq: 0
+  clear_cache_freq: 5
+  head_pointcloud_only: true
+  render_on_observation_only: true
+  log_action_steps: false
+  rendering:
+    shader: rt
+    samples_per_pixel: 32
+    path_depth: 8
+    denoiser: oidn
+  expert_seed_cache_dir: null
+  expert_seed_cache_mode: 'off'
+  action_type: qpos
+  reward_progress_scale: 1.0
+  reward_success_bonus: 1.5
+  reward_healthy: 0.0
+  reward_ctrl_cost_weight: 0.001
+  reward_ctrl_cost_mode: delta
+  reward_ctrl_cost_normalize: true
+  reward_contact_cost_weight: 0.0
+  reward_time_cost: 0.0
+  reward_use_task_progress_fallback: true
+validation:
+  interval: 20
+  run_final: true
+  seed_file: /media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds_validation_shared.json
+  seed: 20
+  episodes: 100
+  scene_selection: rl
+  max_seed_tries: 10000

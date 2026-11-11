@@ -125,6 +125,12 @@ class TrainManiFlowRoboTwinWorkspace:
             if lastest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                # Epoch-end checkpoints precede the counter increments below.
+                self.epoch += 1
+                self.global_step += 1
+                if self.epoch >= cfg.training.num_epochs:
+                    print(f"Training already completed {self.epoch} epochs.")
+                    return
 
         # configure dataset
         dataset: BaseDataset
@@ -168,6 +174,9 @@ class TrainManiFlowRoboTwinWorkspace:
             ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
+            # Preserve EMA warmup instead of overwriting the loaded EMA on the
+            # first resumed update (decay=0 when optimization_step starts at 0).
+            ema.optimization_step = self.global_step
             
         # configure env runner
         # env_runner: BaseRunner
@@ -214,7 +223,7 @@ class TrainManiFlowRoboTwinWorkspace:
         
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        for local_epoch_idx in range(cfg.training.num_epochs):
+        for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
             step_log = dict()
             # ========= train for this epoch ==========
             train_losses = list()
@@ -406,7 +415,13 @@ class TrainManiFlowRoboTwinWorkspace:
         lastest_ckpt_path = self.get_checkpoint_path(tag=mode, monitor_key=cfg.checkpoint.topk.monitor_key)
         if lastest_ckpt_path.is_file():
             cprint(f"Resuming from {mode} checkpoint {lastest_ckpt_path}", 'magenta')
-            self.load_checkpoint(path=lastest_ckpt_path) # rewrite self.output_dir
+            # Evaluation only needs policy/EMA weights and metadata. Loading the
+            # training optimizer makes legacy checkpoints incompatible whenever
+            # the current policy has gained parameters (for example action_plan).
+            self.load_checkpoint(
+                path=lastest_ckpt_path,
+                exclude_keys=('optimizer',),
+            ) # rewrite self.output_dir
             # print ckpt info
             cprint(f"{self.epoch} epochs, {self.global_step} steps", 'magenta')
         else:
@@ -485,6 +500,10 @@ class TrainManiFlowRoboTwinWorkspace:
         if tag=='latest':
             return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
         elif tag=='best': 
+            exact_ckpt = pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
+            if exact_ckpt.is_file():
+                return exact_ckpt
+
             # the checkpoints are saved as format: epoch={}-test_mean_score={}.ckpt
             # find the best checkpoint
             checkpoint_dir = pathlib.Path(self.output_dir).joinpath('checkpoints')

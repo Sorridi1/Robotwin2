@@ -1,0 +1,41 @@
+{
+  "checkpoint": "/media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-fpopp-0428_recommended_seed0/checkpoints/latest.ckpt",
+  "iteration": 34,
+  "actor_lr": 1e-05,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0,
+  "step_min": 960,
+  "step_max": 960,
+  "total_optimizer_elements": 180815630,
+  "sampled_elements": 258093,
+  "quantiles": [
+    0.009999999776482582,
+    0.10000000149011612,
+    0.5,
+    0.8999999761581421,
+    0.9900000095367432
+  ],
+  "sqrt_vhat_quantiles": [
+    1.6291256121903075e-09,
+    1.078500222462253e-08,
+    8.59265526287345e-07,
+    6.902722816448659e-06,
+    2.8702992494800128e-05
+  ],
+  "fraction_sqrt_vhat_below_official_eps": 0.9396922588348389,
+  "same_moments_update_ratio_current_eps_vs_1e_5": [
+    1.3479257822036743,
+    2.4451613426208496,
+    12.492460250854492,
+    481.6349792480469,
+    860.0499267578125
+  ],
+  "estimated_same_moments_update_l2_ratio": 4.089088926346725,
+  "estimated_update_rms_current_eps": 1.573711862272435e-06,
+  "estimated_update_rms_eps_1e_5": 3.848563556866495e-07,
+  "note": "approximately uniform coordinate subsampling; same-moment epsilon sensitivity only, not a counterfactual training result"
+}

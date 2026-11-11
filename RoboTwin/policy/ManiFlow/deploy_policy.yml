@@ -6,6 +6,19 @@ ckpt_setting: null
 seed: null
 instruction_type: unseen
 
+# expert: original expert-success cohort; rl: online RL cheap validity checks;
+# expert_fail: cheap-valid scenes on which a normal expert rollout fails.
+# baseline_fail: cheap-valid scenes on which the fixed baseline reaches its step limit without success.
+eval_scene_selection: expert
+eval_num_episodes: 100
+eval_max_seed_tries: 10000
+eval_scene_seed_file: /media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json
+eval_scene_validation_config: null  # existing bank rules; archived/repository RL rules on first creation
+eval_scene_manifest: null           # optional legacy explicit replay; normally leave null
+eval_scene_cache_mode: readwrite
+eval_scene_cache_dir: /media/Elements1/ljj/ManiFlow/cache/eval_scenes
+eval_baseline_checkpoint: /media/Elements1/ljj/ManiFlow/outputs/place_empty_cup-maniflow_pointcloud_policy_robotwin2-0428_seed0/checkpoints/epoch=0500-val_loss=0.373935.ckpt
+
 # Add Parameters You Need
 config_name: robot_maniflow
 ckpt_tag: latest

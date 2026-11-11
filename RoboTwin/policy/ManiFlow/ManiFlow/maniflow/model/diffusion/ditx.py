@@ -62,6 +62,7 @@ class DiTX(nn.Module):
         pre_norm_modality: bool = False,
         language_conditioned: bool=False,
         language_model: str = "t5-small",
+        plan_dim: int = None,
     ):
         super().__init__()
         self.n_obs_steps = n_obs_steps
@@ -78,6 +79,7 @@ class DiTX(nn.Module):
         self.hidden_dim = n_emb
         self.input_emb = nn.Linear(input_dim, n_emb)
         self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
+        self.plan_proj = nn.Linear(plan_dim, n_emb) if plan_dim is not None else None
         self.vis_cond_obs_emb = nn.Linear(cond_dim, n_emb) # visual condition observation embedding
         self.vis_cond_pos_embed = nn.Parameter(
             torch.zeros(1, visual_cond_len * n_obs_steps, n_emb)
@@ -295,6 +297,11 @@ class DiTX(nn.Module):
         nn.init.constant_(self.final_layer.ffn_final.fc2.weight, 0)
         nn.init.constant_(self.final_layer.ffn_final.fc2.bias, 0)
 
+        # Preserve pretrained ManiFlow behavior until the additive plan path learns.
+        if self.plan_proj is not None:
+            nn.init.zeros_(self.plan_proj.weight)
+            nn.init.zeros_(self.plan_proj.bias)
+
     def get_optim_groups(self, weight_decay: float=1e-3):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
@@ -374,6 +381,7 @@ class DiTX(nn.Module):
             target_t: Union[torch.Tensor, float, int], 
             vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
+            plan_cond: torch.Tensor = None,
             **kwargs):
         """
         Forward pass of the DiTX model.
@@ -391,6 +399,15 @@ class DiTX(nn.Module):
         # process input
         input_emb = self.input_emb(sample) # (B, T, n_emb)
         x = input_emb + self.pos_emb # (B, T, n_emb)
+        if plan_cond is not None:
+            if self.plan_proj is None:
+                raise ValueError("plan_cond was provided but DiTX plan injection is disabled")
+            expected_shape = (sample.shape[0], self.horizon, self.plan_proj.in_features)
+            if tuple(plan_cond.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected plan_cond shape {expected_shape}, got {tuple(plan_cond.shape)}"
+                )
+            x = x + self.plan_proj(plan_cond.to(device=sample.device, dtype=sample.dtype))
  
 
         # 1. time

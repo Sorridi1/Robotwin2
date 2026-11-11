@@ -1,15 +1,14 @@
 #!/bin/bash
 set -eo pipefail
 
-# bash scripts/train_rl_policy.sh ${alg_name} ${task_name} ${setting} ${expert_data_num} ${addition_info} ${seed} ${gpu_id} ${pretrained_ckpt} [task_config]
+# bash scripts/train_rl_policy.sh ${alg_name} ${task_name} ${setting} ${expert_data_num} ${addition_info} ${seed} ${gpu_id} ${pretrained_ckpt} [task_config] [Hydra overrides...]
 #
 # Runtime switches:
 #   TRAIN=false EVAL=true bash scripts/train_rl_policy.sh ...
-#   EVAL=true EXPORT_RL_RESUME_ACTOR=true bash scripts/train_rl_policy.sh ...
 
 DEBUG=${DEBUG:-False}
-train=false
-eval=true
+train=${TRAIN:-true}
+eval=${EVAL:-false}
 
 alg_name=${1:-reinflow_rl_pointcloud_robotwin2}
 task_name=${2}
@@ -20,6 +19,7 @@ seed=${6}
 gpu_id=${7}
 pretrained_ckpt=${8}
 task_config=${9:-demo_clean_ur5}
+extra_overrides=("${@:10}")
 
 is_blank() {
     [ -z "${1//[[:space:]]/}" ]
@@ -52,19 +52,40 @@ config_name=${alg_name}
 exp_name=${task_name}-${alg_name}-${addition_info}
 run_dir="/media/Elements1/ljj/ManiFlow/outputs/${exp_name}_seed${seed}"
 policy_name=ManiFlow
+eval_policy_name=${RL_EVAL_POLICY_NAME:-ManiFlow}
 eval_task_config=${EVAL_TASK_CONFIG:-${task_config}}
 eval_ckpt_setting=${EVAL_CKPT_SETTING:-${task_config}}
 eval_seed=${EVAL_SEED:-0}
-# 导出RL resume actor的开关，默认为true，如果设置为false，则eval_ckpt_tag默认为latest
-export_rl_resume_actor=false
-if [ -n "${EVAL_CKPT_TAG:-}" ]; then
-    eval_ckpt_tag=${EVAL_CKPT_TAG}
-elif [ "${export_rl_resume_actor}" = true ]; then
-    eval_ckpt_tag=final_rl_actor
-else
-    eval_ckpt_tag=latest
+eval_ckpt_tag=${EVAL_CKPT_TAG:-best}
+eval_scene_selection=${EVAL_SCENE_SELECTION:-expert}
+eval_num_episodes=${EVAL_NUM_EPISODES:-100}
+eval_max_seed_tries=${EVAL_MAX_SEED_TRIES:-10000}
+scene_eval_args=(
+    --eval_scene_selection "${eval_scene_selection}"
+    --eval_num_episodes "${eval_num_episodes}"
+    --eval_max_seed_tries "${eval_max_seed_tries}"
+    --eval_scene_cache_mode "${EVAL_SCENE_CACHE_MODE:-readwrite}"
+    --eval_scene_seed_file "${EVAL_SCENE_SEED_FILE:-/media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json}"
+)
+scene_eval_overrides=(
+    "rl.eval.scene_selection=${eval_scene_selection}"
+    "rl.eval.num_episodes=${eval_num_episodes}"
+    "rl.eval.max_seed_tries=${eval_max_seed_tries}"
+    "rl.eval.scene_cache_mode=${EVAL_SCENE_CACHE_MODE:-readwrite}"
+    "rl.eval.scene_seed_file=${EVAL_SCENE_SEED_FILE:-/media/Elements1/ljj/ManiFlow/outputs/eval_scene_seeds.json}"
+)
+if [ -n "${EVAL_SCENE_VALIDATION_CONFIG:-}" ]; then
+    scene_eval_args+=(--eval_scene_validation_config "${EVAL_SCENE_VALIDATION_CONFIG}")
+    scene_eval_overrides+=("rl.eval.scene_validation_config=${EVAL_SCENE_VALIDATION_CONFIG}")
 fi
-rl_resume_ckpt=${RL_RESUME_CKPT:-${run_dir}/checkpoints/latest_rl.ckpt}
+if [ -n "${EVAL_SCENE_MANIFEST:-}" ]; then
+    scene_eval_args+=(--eval_scene_manifest "${EVAL_SCENE_MANIFEST}")
+    scene_eval_overrides+=("rl.eval.scene_manifest=${EVAL_SCENE_MANIFEST}")
+fi
+if [ -n "${EVAL_BASELINE_CHECKPOINT:-}" ]; then
+    scene_eval_args+=(--eval_baseline_checkpoint "${EVAL_BASELINE_CHECKPOINT}")
+    scene_eval_overrides+=("rl.eval.baseline_checkpoint=\"${EVAL_BASELINE_CHECKPOINT}\"")
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFLOW_POLICY_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -123,7 +144,16 @@ if [ "${train}" = true ]; then
         logging.name=${exp_name} \
         expert_data_num=${expert_data_num} \
         setting=${setting} \
-        rl.pretrained_checkpoint_path=${pretrained_ckpt}
+        rl.pretrained_checkpoint_path=${pretrained_ckpt} \
+        rl.eval.config_name=${config_name} \
+        rl.eval.alg_name=${alg_name} \
+        rl.eval.policy_name=${eval_policy_name} \
+        rl.eval.task_config=${eval_task_config} \
+        rl.eval.ckpt_setting=${eval_ckpt_setting} \
+        rl.eval.seed=${eval_seed} \
+        rl.eval.addition_info=${addition_info} \
+        "${scene_eval_overrides[@]}" \
+        "${extra_overrides[@]}"
 else
     echo -e "\033[33m=== RL training disabled ===\033[0m"
 fi
@@ -133,41 +163,8 @@ if [ "${eval}" = false ]; then
     exit 0
 fi
 
-if [ "${export_rl_resume_actor}" = true ]; then
-    if [ ! -f "${rl_resume_ckpt}" ]; then
-        echo -e "\033[31mRL resume checkpoint not found: ${rl_resume_ckpt}\033[0m"
-        exit 1
-    fi
-
-    cd "${WORKSPACE_DIR}"
-    echo -e "\033[32m=== Exporting deploy actor from RL resume checkpoint ===\033[0m"
-    ${PYTHON_BIN} train_reinflow_rl_robotwin2_workspace.py \
-        --config-name=${config_name}.yaml \
-        task_name=${task_name} \
-        task_config=${task_config} \
-        hydra.run.dir=${run_dir} \
-        training.debug=$DEBUG \
-        training.seed=${seed} \
-        training.device=cuda:0 \
-        exp_name=${exp_name} \
-        logging.mode=disabled \
-        logging.name=${exp_name} \
-        expert_data_num=${expert_data_num} \
-        setting=${setting} \
-        rl.resume_path=${rl_resume_ckpt} \
-        rl.export_resume_actor_only=true \
-        rl.export_resume_actor_tag=${eval_ckpt_tag} 
-
-
-    exported_actor_ckpt="${run_dir}/checkpoints/${eval_ckpt_tag}.ckpt"
-    if [ ! -f "${exported_actor_ckpt}" ]; then
-        echo -e "\033[31mFailed to export deploy actor checkpoint: ${exported_actor_ckpt}\033[0m"
-        exit 1
-    fi
-fi
-
 echo -e "\033[32m=== Evaluating ManiFlow RL policy ===\033[0m"
-echo -e "\033[33mckpt tag: ${eval_ckpt_tag}, gpu id: ${gpu_id}\033[0m"
+echo -e "\033[33mckpt tag: ${eval_ckpt_tag}, eval policy: ${eval_policy_name}, gpu id: ${gpu_id}\033[0m"
 
 cd "${ROBOTWIN_ROOT}"
 
@@ -181,7 +178,8 @@ ${PYTHON_BIN} script/eval_policy.py --config policy/${policy_name}/deploy_policy
     --expert_data_num ${expert_data_num} \
     --training_seed ${seed} \
     --seed ${eval_seed} \
-    --policy_name ${policy_name} \
+    --policy_name ${eval_policy_name} \
     --addition_info ${addition_info} \
     --alg_name ${alg_name} \
-    --ckpt_tag ${eval_ckpt_tag}
+    --ckpt_tag ${eval_ckpt_tag} \
+    "${scene_eval_args[@]}"

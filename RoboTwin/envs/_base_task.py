@@ -68,6 +68,9 @@ class Base_Task(gym.Env):
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
+        self.render_on_observation_only = bool(kwags.get("render_on_observation_only", False))
+        self.rendering = dict(kwags.get("rendering") or {})
+        self.log_action_steps = bool(kwags.get("log_action_steps", True))
 
         self.need_topp = True  # TODO
 
@@ -191,6 +194,10 @@ class Base_Task(gym.Env):
         check(500)
         return is_stable, unstable_list
 
+    def get_scene_metadata(self):
+        """Describe the initialized scene without executing the scripted expert."""
+        return deepcopy(self.info)
+
     def play_once(self):
         pass
 
@@ -211,10 +218,11 @@ class Base_Task(gym.Env):
         # give renderer to sapien sim
         self.engine.set_renderer(self.renderer)
 
-        sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
-        sapien.render.set_ray_tracing_path_depth(8)
-        sapien.render.set_ray_tracing_denoiser("oidn")
+        rendering = getattr(self, "rendering", {})
+        sapien.render.set_camera_shader_dir(rendering.get("shader", "rt"))
+        sapien.render.set_ray_tracing_samples_per_pixel(int(rendering.get("samples_per_pixel", 32)))
+        sapien.render.set_ray_tracing_path_depth(int(rendering.get("path_depth", 8)))
+        sapien.render.set_ray_tracing_denoiser(rendering.get("denoiser", "oidn"))
 
         # declare sapien scene
         scene_config = sapien.SceneConfig()
@@ -416,11 +424,20 @@ class Base_Task(gym.Env):
 
     # =========================================================== Sapien ===========================================================
 
-    def _update_render(self):
+    def _update_render(self, force=False):
         """
         Update rendering to refresh the camera's RGBD information
         (rendering must be updated even when disabled, otherwise data cannot be collected).
         """
+        if (
+            getattr(self, "render_on_observation_only", False)
+            and not force
+            and not self.render_freq
+            and not self.save_data
+            and self.eval_video_path is None
+            and not self.crazy_random_light
+        ):
+            return
         if self.crazy_random_light:
             for renderColor in self.point_light_lst:
                 renderColor.set_color([np.random.rand(), np.random.rand(), np.random.rand()])
@@ -435,7 +452,7 @@ class Base_Task(gym.Env):
     # =========================================================== Basic APIs ===========================================================
 
     def get_obs(self):
-        self._update_render()
+        self._update_render(force=True)
         self.cameras.update_picture()
         pkl_dic = {
             "observation": {},
@@ -1485,7 +1502,8 @@ class Base_Task(gym.Env):
             self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
 
         self.take_action_cnt += 1
-        print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
+        if getattr(self, "log_action_steps", True):
+            print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
         self._update_render()
         if self.render_freq:

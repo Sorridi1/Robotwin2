@@ -1,0 +1,32 @@
+task_name: duco_wipe_whiteboard
+embodiment: duco_gcr3
+dual_arm: false
+geometry_root: /home/ljj/code/maniskill
+urdf_path: /home/ljj/code/maniskill/duco_gcr3_618/urdf/duco_gcr3.urdf
+dataset_root: /media/Elements1/users/ysj/rise_datasets/wipe-v1-one-pass-clean-whiteboard@100
+deploy_root: /home/ljj/code/Robotwin2/RoboTwin/deploy
+object_config: /home/ljj/code/maniskill/configs/duco_wipe_objects.json
+demo: 50
+sim_freq: 240
+control_freq: 10
+max_steps: 300
+# ONE provisional estimate from demo 50 for ALL scenes, not hardware calibration.
+# raw reproduces the original assembly, including its known mismatch.
+tool_mount: estimated
+tool_calibration: null
+scene_profile: null
+robot:
+  arm_stiffness: 1600
+  arm_damping: 80
+  arm_force_limit: 100
+  gripper_stiffness: 1200
+  gripper_damping: 40
+  gripper_force_limit: 25
+  max_joint_step_rad: 0.30
+camera:
+  width: 1280
+  height: 720
+  near: 0.01
+  far: 2.0
+rendering:
+  shader: default
